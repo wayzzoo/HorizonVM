@@ -1,4 +1,5 @@
 #include <Hypervisor/hv_vcpu.h>
+#include <Hypervisor/hv_vcpu_types.h>
 #include <Hypervisor/hv_vm.h>
 #include <arm64/hv/hv_kern_types.h>
 #include <stdio.h>
@@ -71,9 +72,20 @@ int main(void) {
 
     memset(guest_ram, 0, guest_ram_size);
 
+    const uint32_t guest_code[] = {
+        0xD2800540, // mov x0, #42
+        0xD2800141, // mov x1, #10
+        0x8B010002, // add x2, x0, x1
+        0xD4200000  // brk #0   
+    };
+
+    memcpy(guest_ram, guest_code, sizeof(guest_code));
+
+    printf("[HVM] Loaded %zu bytes of ARM64 code\n", sizeof(guest_code));
+
     printf("[HVM] Allocated %zu bytes of guest RAM\n", guest_ram_size);
 
-    result = hv_vm_map(guest_ram, guest_base, guest_ram_size, HV_MEMORY_READ | HV_MEMORY_WRITE);
+    result = hv_vm_map(guest_ram, guest_base, guest_ram_size, HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
 
 
     if (result != HV_SUCCESS) {
@@ -86,6 +98,73 @@ int main(void) {
     }
 
     printf("[HVM] Guest RAM mapped at 0x%llx\n", (unsigned long long)guest_base);
+
+    result = hv_vcpu_set_trap_debug_exceptions(vcpu, true);
+
+    if (result != HV_SUCCESS) {
+        fprintf(stderr, "[HVM] Failed to enable debug traps: %d\n", result);
+        hv_vm_unmap(guest_base, guest_ram_size);
+        munmap(guest_ram, guest_ram_size);
+        hv_vcpu_destroy(vcpu);
+        hv_vm_destroy();
+        return 1;
+    }
+
+    result = hv_vcpu_set_reg(vcpu, HV_REG_PC, guest_base);
+
+    if (result != HV_SUCCESS) {
+        fprintf(stderr, "[HVM] Failed to set PC: %d\n", result);
+        hv_vm_unmap(guest_base, guest_ram_size);
+        munmap(guest_ram, guest_ram_size);
+        hv_vcpu_destroy(vcpu);
+        hv_vm_destroy();
+        return 1;
+    }
+
+    printf("[HVM] Starting guest execution at 0x%llx\n", (unsigned long long)guest_base);
+
+
+    result = hv_vcpu_run(vcpu);
+
+
+    if (result != HV_SUCCESS) {
+        fprintf(stderr, "[HVM] Guest executuion failed: %d\n", result);
+        hv_vm_unmap(guest_base, guest_ram_size);
+        munmap(guest_ram, guest_ram_size);
+        hv_vcpu_destroy(vcpu);
+        hv_vm_destroy();
+        return 1;
+    }
+
+    uint64_t x2 = 0;
+
+    result = hv_vcpu_get_reg(vcpu, HV_REG_X2, &x2);
+
+    if (result != HV_SUCCESS) {
+        fprintf(stderr, "[HVM] Failed to read X2: %d\n", result);
+        hv_vm_unmap(guest_base, guest_ram_size);
+        munmap(guest_ram, guest_ram_size);
+        hv_vcpu_destroy(vcpu);
+        hv_vm_destroy();
+        return 1;
+    }
+
+    printf("[HVM] Guest X2 = %llu\n",(unsigned long long)x2);
+
+    if(exit_info->reason == HV_EXIT_REASON_EXCEPTION) {
+        uint64_t syndrome = exit_info->exception.syndrome;
+        unsigned int ec = (unsigned int)((syndrome >> 26) & 0x3F);
+
+        printf("[HVM] Exception class: 0x%02X\n", ec);
+
+        if (ec == 0x3C && x2 == 52) {
+            printf("[HVM] ARM64 guest execution PASSED\n");
+        } else {
+            printf("[HVM] Unexpected guest expection or result\n");
+        }
+    } else {
+        printf("[HVM] Unexpected VM exit reason: %d\n", exit_info->reason);
+    }
 
     result = hv_vm_unmap(guest_base, guest_ram_size);
     
