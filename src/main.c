@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <stdbool.h>
 
 int main(void) {
     printf("HorizonVM - Apple Silicon Hypervisor\n");
@@ -73,9 +74,7 @@ int main(void) {
     memset(guest_ram, 0, guest_ram_size);
 
     const uint32_t guest_code[] = {
-        0xD2800540, // mov x0, #42
-        0xD2800141, // mov x1, #10
-        0x8B010002, // add x2, x0, x1
+        0xB9400064, // ldr w4, [x3]
         0xD4200000  // brk #0   
     };
 
@@ -121,6 +120,21 @@ int main(void) {
         return 1;
     }
 
+    const uint64_t mmio_base = 0x50000000;
+
+    result = hv_vcpu_set_reg(vcpu, HV_REG_X3, mmio_base);
+
+    if (result != HV_SUCCESS) {
+        fprintf(stderr, "[HVM] Failed to set MMIO address: %d\n", result);
+        hv_vm_unmap(guest_base, guest_ram_size);
+        munmap(guest_ram, guest_ram_size);
+        hv_vcpu_destroy(vcpu);
+        hv_vm_destroy();
+        return 1;
+    }
+
+    printf("[HVM] MMIO target: 0x%llx\n",(unsigned long long)mmio_base);
+
     printf("[HVM] Starting guest execution at 0x%llx\n", (unsigned long long)guest_base);
 
 
@@ -149,21 +163,25 @@ int main(void) {
         return 1;
     }
 
-    printf("[HVM] Guest X2 = %llu\n",(unsigned long long)x2);
+    bool mmio_passed = false;
 
     if(exit_info->reason == HV_EXIT_REASON_EXCEPTION) {
         uint64_t syndrome = exit_info->exception.syndrome;
+        uint64_t physical = exit_info->exception.physical_address;
+
         unsigned int ec = (unsigned int)((syndrome >> 26) & 0x3F);
 
         printf("[HVM] Exception class: 0x%02X\n", ec);
+        printf("[HVM] Fault IPA: 0x%llx\n",(unsigned long long)physical);
 
-        if (ec == 0x3C && x2 == 52) {
-            printf("[HVM] ARM64 guest execution PASSED\n");
+        if ((ec == 0x24 || ec == 0x25) && physical == mmio_base) {
+            printf("[HVM] MMIO trap PASSED\n");
+            mmio_passed = true;
         } else {
-            printf("[HVM] Unexpected guest expection or result\n");
+            printf("[HVM] Unexpected exception\n");
         }
     } else {
-        printf("[HVM] Unexpected VM exit reason: %d\n", exit_info->reason);
+        printf("[HVM] Unexpected exit reason: %d\n",exit_info->reason);
     }
 
     result = hv_vm_unmap(guest_base, guest_ram_size);
@@ -202,6 +220,10 @@ int main(void) {
     }
 
     printf("[HVM] Virtual machine destroyed successfully\n");
+
+    if (!mmio_passed) {
+        return 1;
+    }
 
     return 0;
 }
