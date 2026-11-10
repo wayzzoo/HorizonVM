@@ -10,10 +10,12 @@
 #include <sys/mman.h>
 #include <stdbool.h>
 
+#include <hypervisor/vm.h>
+
 int main(void) {
     printf("HorizonVM - Apple Silicon Hypervisor\n");
 
-    hv_return_t result = hv_vm_create(NULL);
+    hv_return_t result = hvm_vm_create();
     hv_vcpu_t vcpu;
     hv_vcpu_exit_t *exit_info = NULL;
 
@@ -28,7 +30,7 @@ int main(void) {
 
     if (result != HV_SUCCESS) {
         fprintf(stderr, "[HVM] vCPU creation failed: %d\n", result);
-        hv_vm_destroy();
+        hvm_vm_destroy();
         return 1;
     }
 
@@ -41,7 +43,7 @@ int main(void) {
     if (result != HV_SUCCESS) {
         fprintf(stderr, "[HVM] Failed to set X0: %d\n", result);
         hv_vcpu_destroy(vcpu);
-        hv_vm_destroy();
+        hvm_vm_destroy();
         return 1;
     }
 
@@ -50,7 +52,7 @@ int main(void) {
     if (result != HV_SUCCESS) {
         fprintf(stderr, "[HVM] Failed to read X0: %d\n", result);
         hv_vcpu_destroy(vcpu);
-        hv_vm_destroy();
+        hvm_vm_destroy();
         return 1;
     }
 
@@ -67,7 +69,7 @@ int main(void) {
     if (guest_ram == MAP_FAILED) {
         fprintf(stderr, "[HVM] Guest RAM allocation failed\n");
         hv_vcpu_destroy(vcpu);
-        hv_vm_destroy();
+        hvm_vm_destroy();
         return 1;
     }
 
@@ -92,7 +94,7 @@ int main(void) {
 
         munmap(guest_ram, guest_ram_size);
         hv_vcpu_destroy(vcpu);
-        hv_vm_destroy();
+        hvm_vm_destroy();
         return 1;
     }
 
@@ -105,7 +107,7 @@ int main(void) {
         hv_vm_unmap(guest_base, guest_ram_size);
         munmap(guest_ram, guest_ram_size);
         hv_vcpu_destroy(vcpu);
-        hv_vm_destroy();
+        hvm_vm_destroy();
         return 1;
     }
 
@@ -116,7 +118,7 @@ int main(void) {
         hv_vm_unmap(guest_base, guest_ram_size);
         munmap(guest_ram, guest_ram_size);
         hv_vcpu_destroy(vcpu);
-        hv_vm_destroy();
+        hvm_vm_destroy();
         return 1;
     }
 
@@ -129,7 +131,7 @@ int main(void) {
         hv_vm_unmap(guest_base, guest_ram_size);
         munmap(guest_ram, guest_ram_size);
         hv_vcpu_destroy(vcpu);
-        hv_vm_destroy();
+        hvm_vm_destroy();
         return 1;
     }
 
@@ -146,7 +148,7 @@ int main(void) {
         hv_vm_unmap(guest_base, guest_ram_size);
         munmap(guest_ram, guest_ram_size);
         hv_vcpu_destroy(vcpu);
-        hv_vm_destroy();
+        hvm_vm_destroy();
         return 1;
     }
 
@@ -159,7 +161,7 @@ int main(void) {
         hv_vm_unmap(guest_base, guest_ram_size);
         munmap(guest_ram, guest_ram_size);
         hv_vcpu_destroy(vcpu);
-        hv_vm_destroy();
+        hvm_vm_destroy();
         return 1;
     }
 
@@ -190,7 +192,7 @@ int main(void) {
     if(result != HV_SUCCESS) {
         fprintf(stderr, "[HVM] Guest RAM unmapping failed: %d\n", result);
         hv_vcpu_destroy(vcpu);
-        hv_vm_destroy();
+        hvm_vm_destroy();
         return 1;
     }
 
@@ -205,14 +207,14 @@ int main(void) {
 
     if(result != HV_SUCCESS) {
         fprintf(stderr, "[HVM] vCPU destruction failed: %d\n", result);
-        hv_vm_destroy();
+        hvm_vm_destroy();
         return 1;
     }
 
     printf("[HVM] Virtual CPU destroyed successfully\n");
     
 
-    result = hv_vm_destroy();
+    result = hvm_vm_destroy();
 
     if (result != HV_SUCCESS) {
         fprintf(stderr, "[HVM] VM desctruction failed: %d\n", result);
