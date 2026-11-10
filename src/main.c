@@ -1,7 +1,9 @@
+#include <Hypervisor/hv_vcpu.h>
 #include <Hypervisor/hv_vm.h>
 #include <arm64/hv/hv_kern_types.h>
 #include <stdio.h>
 #include <Hypervisor/Hypervisor.h>
+#include <stdint.h>
 
 int main(void) {
     printf("HorizonVM - Apple Silicon Hypervisor\n");
@@ -27,6 +29,27 @@ int main(void) {
 
     printf("[HVM] Virtual CPU created successufully\n");
 
+    uint64_t value = 42;
+
+    result = hv_vcpu_set_reg(vcpu, HV_REG_X0, value);
+
+    if (result != HV_SUCCESS) {
+        fprintf(stderr, "[HVM] Failed to set X0: %d\n", result);
+        hv_vcpu_destroy(vcpu);
+        hv_vm_destroy();
+        return 1;
+    }
+
+    result = hv_vcpu_get_reg(vcpu, HV_REG_X0, &value);
+
+    if (result != HV_SUCCESS) {
+        fprintf(stderr, "[HVM] Failed to read X0: %d\n", result);
+        hv_vcpu_destroy(vcpu);
+        hv_vm_destroy();
+        return 1;
+    }
+
+    printf("[HVM] Guest register X0 = %llu\n",(unsigned long long)value);
 
     result = hv_vcpu_destroy(vcpu);
 
