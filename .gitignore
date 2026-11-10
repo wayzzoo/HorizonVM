@@ -1,0 +1,19 @@
+
+
+# Build artifacts
+build/
+dist/
+*.o
+*.a
+*.dSYM/
+horizonvm
+
+# macOS
+.DS_Store
+
+# VS Code
+.vscode/
+
+# Temporary files
+*.log
+*.tmp
