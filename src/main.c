@@ -140,56 +140,141 @@ int main(void) {
         return 1;
     }
 
-    result = hv_vcpu_run(cpu.handle);
+    bool guest_read_passed = false;
 
+    do {
+        result = hv_vcpu_run(cpu.handle);
 
-    if (result != HV_SUCCESS) {
-        fprintf(stderr, "[HVM] Guest executuion failed: %d\n", result);
-        hvm_memory_destroy(&memory);
-        hvm_vcpu_destroy(&cpu);
-        hvm_vm_destroy();
-        return 1;
-    }
+        if (result != HV_SUCCESS) {
+            fprintf(stderr, "[HVM] Guest execution failed: %d\n", result);  
+            break;
+        }
 
-    uint64_t x2 = 0;
+        if (cpu.exit_info == NULL ||
+            cpu.exit_info->reason != HV_EXIT_REASON_EXCEPTION) {
+                fprintf(stderr, "[HVM] Unexpected VM exit\n");
+                break;
+        }
 
-    result = hv_vcpu_get_reg(cpu.handle, HV_REG_X2, &x2);
+        uint64_t esr = cpu.exit_info->exception.syndrome;
+        uint64_t ipa = cpu.exit_info->exception.physical_address;
 
-    if (result != HV_SUCCESS) {
-        fprintf(stderr, "[HVM] Failed to read X2: %d\n", result);
-        hvm_memory_destroy(&memory);
-        hvm_vcpu_destroy(&cpu);
-        hvm_vm_destroy();
-        return 1;
-    }
-
-    bool mmio_passed = false;
-
-    if(cpu.exit_info->reason == HV_EXIT_REASON_EXCEPTION) {
-        uint64_t syndrome = cpu.exit_info->exception.syndrome;
-        uint64_t physical = cpu.exit_info->exception.physical_address;
-
-        unsigned int ec = (unsigned int)((syndrome >> 26) & 0x3F);
+        unsigned int ec = (unsigned int)((esr >> 26) & 0x3F);
 
         printf("[HVM] Exception class: 0x%02X\n", ec);
-        printf("[HVM] Fault IPA: 0x%llx\n",(unsigned long long)physical);
+        printf("[HVM] Fault IPA: 0x%llx\n",(unsigned long long)ipa);
 
-        if ((ec == 0x24 || ec == 0x25) &&
-            physical == mmio_base) {
+        if ((ec != 0x24 && ec != 0x25) || ipa != mmio_base) {
+            fprintf(stderr, "[HVM] Unexpected memory fault\n");
+            break;
+        }
 
-            uint32_t value = 0;
+        uint64_t pc = 0;
 
-            if (hvm_mmio_read32(&mmio, physical, &value)) {
-                printf("[HVM] Tegra timer read: %u us\n", value);
-                printf("[HVM] Timer MMIO dispatch PASSED\n");
-                mmio_passed = true;
-            } else {
-                printf("[HVM] Timer MMIO read failed\n");
+        result = hv_vcpu_get_reg(cpu.handle, HV_REG_PC, &pc);
+
+        if (result != HV_SUCCESS || pc != guest_base) {
+            fprintf(stderr, "[HVM] Unexpected guest PC\n");
+            break;
+        }
+
+        uint32_t opcode = 0;
+        memcpy(&opcode, memory.host_address, sizeof(opcode));
+
+        if (opcode != 0xB9400064) {
+            fprintf(stderr, "[HVM] Unexpected MMIO instruction\n");
+            break;
+        }
+
+        bool isv = ((esr >> 24) & 1U) != 0;
+        bool is_write = ((esr >> 6) & 1U) != 0;
+
+        if (is_write) {
+            fprintf(stderr, "[HVM] Unexpected MMIO write\n");
+            break;
+        }
+
+        if (isv) {
+            unsigned int size = (unsigned int)((esr >> 22) & 3U);
+            unsigned int rt = (unsigned int)((esr >> 16) & 31U);
+            unsigned int sf = (unsigned int) ((esr >> 15) & 1U);
+
+            if (size != 2 || rt != 4 || sf != 0) {
+                fprintf(stderr, "[HVM] Unsupported MMIO accesss\n");
+                break;
             }
-            }
-    } else {
-        printf("[HVM] Unexpected exception\n");
-    }
+        }
+
+        uint32_t value = 0;
+
+
+        if (!hvm_mmio_read32(&mmio, ipa, &value)) {
+            fprintf(stderr, "[HVM] Timer read failed\n");
+            break;
+        }
+
+        printf("[HVM] Timer returned: %u us\n", value);
+
+        // W4 is the lower 32 bits of X4
+        result = hv_vcpu_set_reg(
+            cpu.handle,
+            HV_REG_X4,
+            (uint64_t)value
+        );
+
+        if (result != HV_SUCCESS) {
+            fprintf(stderr, "[HVM] Failed to write X4\n");
+            break;
+        }
+
+
+        // Skip the emulated 4-byte LDR instruction.
+
+        result = hv_vcpu_set_reg(cpu.handle, HV_REG_PC, pc + 4);
+
+        if (result != HV_SUCCESS) {
+            fprintf(stderr, "[HVM] Failed to advance PC\n");
+            break;
+        }
+
+        printf("[HVM] Resuming guest execution\n");
+
+
+        // Second exit: the following BRK instruction.
+
+        result = hv_vcpu_run(cpu.handle);
+
+        if (result != HV_SUCCESS ||
+            cpu.exit_info->reason != HV_EXIT_REASON_EXCEPTION) {
+            fprintf(stderr, "[HVM] Guest resume failed\n");
+            break;
+        }
+
+        uint64_t final_esr = cpu.exit_info->exception.syndrome;
+        unsigned int final_ec = (unsigned int)((final_esr >> 26) & 0x3F);
+
+        uint64_t x4 = 0;
+        result = hv_vcpu_get_reg(cpu.handle, HV_REG_X4, &x4);
+
+        if (result != HV_SUCCESS) {
+            fprintf(stderr, "[HVM] Failed to read X4\n");
+            break;
+        }
+
+        printf("[HVM] Guest X4 = %llu\n", (unsigned long long)x4);
+        printf("[HVM] Final exception: 0x%02X\n", final_ec);
+
+        if (final_ec != 0x3C || x4 != (uint64_t)value) {
+            fprintf(stderr, "[HVM] Guest verification failed\n");
+            break;
+        }
+
+        guest_read_passed = true;
+
+        printf("[HVM] Tegra timer guest read PASSED\n");
+
+
+    } while (0);
 
     result = hvm_memory_destroy(&memory);
 
@@ -225,7 +310,7 @@ int main(void) {
 
     printf("[HVM] Virtual machine destroyed successfully\n");
 
-    if (!mmio_passed) {
+    if (!guest_read_passed) {
         return 1;
     }
 
