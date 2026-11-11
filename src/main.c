@@ -12,6 +12,7 @@
 
 #include <hypervisor/vm.h>
 #include <hypervisor/vcpu.h>
+#include <hypervisor/memory.h>
 
 int main(void) {
     printf("HorizonVM - Apple Silicon Hypervisor\n");
@@ -63,49 +64,38 @@ int main(void) {
     const size_t guest_ram_size = 16384;
     const hv_ipa_t guest_base = 0x40000000;
 
-    void *guest_ram = mmap(NULL, guest_ram_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    hvm_memory_t memory = {0};
 
+    result = hvm_memory_create(
+        &memory,
+        guest_base,
+        guest_ram_size
+    );
 
-    if (guest_ram == MAP_FAILED) {
-        fprintf(stderr, "[HVM] Guest RAM allocation failed\n");
+    if (result != HV_SUCCESS) {
+        fprintf(stderr, "[HVM] Memory creation failed: %d\n", result);
+
         hvm_vcpu_destroy(&cpu);
         hvm_vm_destroy();
         return 1;
     }
-
-    memset(guest_ram, 0, guest_ram_size);
 
     const uint32_t guest_code[] = {
         0xB9400064, // ldr w4, [x3]
         0xD4200000  // brk #0   
     };
 
-    memcpy(guest_ram, guest_code, sizeof(guest_code));
-
-    printf("[HVM] Loaded %zu bytes of ARM64 code\n", sizeof(guest_code));
-
-    printf("[HVM] Allocated %zu bytes of guest RAM\n", guest_ram_size);
-
-    result = hv_vm_map(guest_ram, guest_base, guest_ram_size, HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
+    memcpy(memory.host_address, guest_code, sizeof(guest_code));
 
 
-    if (result != HV_SUCCESS) {
-        fprintf(stderr, "[HVM] Guest RAM mapping failed: %d\n", result);
-
-        munmap(guest_ram, guest_ram_size);
-        hvm_vcpu_destroy(&cpu);
-        hvm_vm_destroy();
-        return 1;
-    }
-
-    printf("[HVM] Guest RAM mapped at 0x%llx\n", (unsigned long long)guest_base);
+    printf("[HVM] Guest RAM mapped at 0x%llx\n",
+        (unsigned long long)guest_base);
 
     result = hv_vcpu_set_trap_debug_exceptions(cpu.handle, true);
 
     if (result != HV_SUCCESS) {
         fprintf(stderr, "[HVM] Failed to enable debug traps: %d\n", result);
-        hv_vm_unmap(guest_base, guest_ram_size);
-        munmap(guest_ram, guest_ram_size);
+        hvm_memory_destroy(&memory);
         hvm_vcpu_destroy(&cpu);
         hvm_vm_destroy();
         return 1;
@@ -115,8 +105,7 @@ int main(void) {
 
     if (result != HV_SUCCESS) {
         fprintf(stderr, "[HVM] Failed to set PC: %d\n", result);
-        hv_vm_unmap(guest_base, guest_ram_size);
-        munmap(guest_ram, guest_ram_size);
+        hvm_memory_destroy(&memory);
         hvm_vcpu_destroy(&cpu);
         hvm_vm_destroy();
         return 1;
@@ -128,8 +117,7 @@ int main(void) {
 
     if (result != HV_SUCCESS) {
         fprintf(stderr, "[HVM] Failed to set MMIO address: %d\n", result);
-        hv_vm_unmap(guest_base, guest_ram_size);
-        munmap(guest_ram, guest_ram_size);
+        hvm_memory_destroy(&memory);
         hvm_vcpu_destroy(&cpu);
         hvm_vm_destroy();
         return 1;
@@ -145,8 +133,7 @@ int main(void) {
 
     if (result != HV_SUCCESS) {
         fprintf(stderr, "[HVM] Guest executuion failed: %d\n", result);
-        hv_vm_unmap(guest_base, guest_ram_size);
-        munmap(guest_ram, guest_ram_size);
+        hvm_memory_destroy(&memory);
         hvm_vcpu_destroy(&cpu);
         hvm_vm_destroy();
         return 1;
@@ -158,8 +145,7 @@ int main(void) {
 
     if (result != HV_SUCCESS) {
         fprintf(stderr, "[HVM] Failed to read X2: %d\n", result);
-        hv_vm_unmap(guest_base, guest_ram_size);
-        munmap(guest_ram, guest_ram_size);
+        hvm_memory_destroy(&memory);
         hvm_vcpu_destroy(&cpu);
         hvm_vm_destroy();
         return 1;
@@ -186,19 +172,16 @@ int main(void) {
         printf("[HVM] Unexpected exit reason: %d\n",cpu.exit_info->reason);
     }
 
-    result = hv_vm_unmap(guest_base, guest_ram_size);
-    
+    result = hvm_memory_destroy(&memory);
 
-    if(result != HV_SUCCESS) {
-        fprintf(stderr, "[HVM] Guest RAM unmapping failed: %d\n", result);
+    if (result != HV_SUCCESS) {
+        fprintf(stderr, "[HVM] Memory cleanup failed: %d\n", result);
         hvm_vcpu_destroy(&cpu);
         hvm_vm_destroy();
         return 1;
     }
 
-    printf("[HVM] Guest RAM unmapped successfully\n");
-
-    munmap(guest_ram, guest_ram_size);
+    printf("[HVM] Guest RAM released successfully\n");
 
    
 
