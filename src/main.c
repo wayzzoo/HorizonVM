@@ -13,6 +13,7 @@
 #include <hypervisor/vm.h>
 #include <hypervisor/vcpu.h>
 #include <hypervisor/memory.h>
+#include <platform/tegra210.h>
 
 int main(void) {
     printf("HorizonVM - Apple Silicon Hypervisor\n");
@@ -62,7 +63,7 @@ int main(void) {
 
 
     const size_t guest_ram_size = 16384;
-    const hv_ipa_t guest_base = 0x40000000;
+    const hv_ipa_t guest_base = T210_IRAM_BASE;
 
     hvm_memory_t memory = {0};
 
