@@ -11,13 +11,13 @@
 #include <stdbool.h>
 
 #include <hypervisor/vm.h>
+#include <hypervisor/vcpu.h>
 
 int main(void) {
     printf("HorizonVM - Apple Silicon Hypervisor\n");
 
     hv_return_t result = hvm_vm_create();
-    hv_vcpu_t vcpu;
-    hv_vcpu_exit_t *exit_info = NULL;
+    hvm_vcpu_t cpu = {0};
 
     if (result != HV_SUCCESS) {
         fprintf(stderr, "[HVM] VM Creation Failed: %d\n", result);
@@ -26,7 +26,7 @@ int main(void) {
 
     printf("[HVM] Virtual machine created successufully\n");
 
-    result = hv_vcpu_create(&vcpu, &exit_info, NULL);
+    result = hvm_vcpu_create(&cpu);
 
     if (result != HV_SUCCESS) {
         fprintf(stderr, "[HVM] vCPU creation failed: %d\n", result);
@@ -38,20 +38,20 @@ int main(void) {
 
     uint64_t value = 42;
 
-    result = hv_vcpu_set_reg(vcpu, HV_REG_X0, value);
+    result = hv_vcpu_set_reg(cpu.handle, HV_REG_X0, value);
 
     if (result != HV_SUCCESS) {
         fprintf(stderr, "[HVM] Failed to set X0: %d\n", result);
-        hv_vcpu_destroy(vcpu);
+        hvm_vcpu_destroy(&cpu);
         hvm_vm_destroy();
         return 1;
     }
 
-    result = hv_vcpu_get_reg(vcpu, HV_REG_X0, &value);
+    result = hv_vcpu_get_reg(cpu.handle, HV_REG_X0, &value);
 
     if (result != HV_SUCCESS) {
         fprintf(stderr, "[HVM] Failed to read X0: %d\n", result);
-        hv_vcpu_destroy(vcpu);
+        hvm_vcpu_destroy(&cpu);
         hvm_vm_destroy();
         return 1;
     }
@@ -68,7 +68,7 @@ int main(void) {
 
     if (guest_ram == MAP_FAILED) {
         fprintf(stderr, "[HVM] Guest RAM allocation failed\n");
-        hv_vcpu_destroy(vcpu);
+        hvm_vcpu_destroy(&cpu);
         hvm_vm_destroy();
         return 1;
     }
@@ -93,44 +93,44 @@ int main(void) {
         fprintf(stderr, "[HVM] Guest RAM mapping failed: %d\n", result);
 
         munmap(guest_ram, guest_ram_size);
-        hv_vcpu_destroy(vcpu);
+        hvm_vcpu_destroy(&cpu);
         hvm_vm_destroy();
         return 1;
     }
 
     printf("[HVM] Guest RAM mapped at 0x%llx\n", (unsigned long long)guest_base);
 
-    result = hv_vcpu_set_trap_debug_exceptions(vcpu, true);
+    result = hv_vcpu_set_trap_debug_exceptions(cpu.handle, true);
 
     if (result != HV_SUCCESS) {
         fprintf(stderr, "[HVM] Failed to enable debug traps: %d\n", result);
         hv_vm_unmap(guest_base, guest_ram_size);
         munmap(guest_ram, guest_ram_size);
-        hv_vcpu_destroy(vcpu);
+        hvm_vcpu_destroy(&cpu);
         hvm_vm_destroy();
         return 1;
     }
 
-    result = hv_vcpu_set_reg(vcpu, HV_REG_PC, guest_base);
+    result = hv_vcpu_set_reg(cpu.handle, HV_REG_PC, guest_base);
 
     if (result != HV_SUCCESS) {
         fprintf(stderr, "[HVM] Failed to set PC: %d\n", result);
         hv_vm_unmap(guest_base, guest_ram_size);
         munmap(guest_ram, guest_ram_size);
-        hv_vcpu_destroy(vcpu);
+        hvm_vcpu_destroy(&cpu);
         hvm_vm_destroy();
         return 1;
     }
 
     const uint64_t mmio_base = 0x50000000;
 
-    result = hv_vcpu_set_reg(vcpu, HV_REG_X3, mmio_base);
+    result = hv_vcpu_set_reg(cpu.handle, HV_REG_X3, mmio_base);
 
     if (result != HV_SUCCESS) {
         fprintf(stderr, "[HVM] Failed to set MMIO address: %d\n", result);
         hv_vm_unmap(guest_base, guest_ram_size);
         munmap(guest_ram, guest_ram_size);
-        hv_vcpu_destroy(vcpu);
+        hvm_vcpu_destroy(&cpu);
         hvm_vm_destroy();
         return 1;
     }
@@ -140,36 +140,36 @@ int main(void) {
     printf("[HVM] Starting guest execution at 0x%llx\n", (unsigned long long)guest_base);
 
 
-    result = hv_vcpu_run(vcpu);
+    result = hv_vcpu_run(cpu.handle);
 
 
     if (result != HV_SUCCESS) {
         fprintf(stderr, "[HVM] Guest executuion failed: %d\n", result);
         hv_vm_unmap(guest_base, guest_ram_size);
         munmap(guest_ram, guest_ram_size);
-        hv_vcpu_destroy(vcpu);
+        hvm_vcpu_destroy(&cpu);
         hvm_vm_destroy();
         return 1;
     }
 
     uint64_t x2 = 0;
 
-    result = hv_vcpu_get_reg(vcpu, HV_REG_X2, &x2);
+    result = hv_vcpu_get_reg(cpu.handle, HV_REG_X2, &x2);
 
     if (result != HV_SUCCESS) {
         fprintf(stderr, "[HVM] Failed to read X2: %d\n", result);
         hv_vm_unmap(guest_base, guest_ram_size);
         munmap(guest_ram, guest_ram_size);
-        hv_vcpu_destroy(vcpu);
+        hvm_vcpu_destroy(&cpu);
         hvm_vm_destroy();
         return 1;
     }
 
     bool mmio_passed = false;
 
-    if(exit_info->reason == HV_EXIT_REASON_EXCEPTION) {
-        uint64_t syndrome = exit_info->exception.syndrome;
-        uint64_t physical = exit_info->exception.physical_address;
+    if(cpu.exit_info->reason == HV_EXIT_REASON_EXCEPTION) {
+        uint64_t syndrome = cpu.exit_info->exception.syndrome;
+        uint64_t physical = cpu.exit_info->exception.physical_address;
 
         unsigned int ec = (unsigned int)((syndrome >> 26) & 0x3F);
 
@@ -183,7 +183,7 @@ int main(void) {
             printf("[HVM] Unexpected exception\n");
         }
     } else {
-        printf("[HVM] Unexpected exit reason: %d\n",exit_info->reason);
+        printf("[HVM] Unexpected exit reason: %d\n",cpu.exit_info->reason);
     }
 
     result = hv_vm_unmap(guest_base, guest_ram_size);
@@ -191,7 +191,7 @@ int main(void) {
 
     if(result != HV_SUCCESS) {
         fprintf(stderr, "[HVM] Guest RAM unmapping failed: %d\n", result);
-        hv_vcpu_destroy(vcpu);
+        hvm_vcpu_destroy(&cpu);
         hvm_vm_destroy();
         return 1;
     }
@@ -203,7 +203,7 @@ int main(void) {
    
 
 
-    result = hv_vcpu_destroy(vcpu);
+    result = hv_vcpu_destroy(cpu.handle);
 
     if(result != HV_SUCCESS) {
         fprintf(stderr, "[HVM] vCPU destruction failed: %d\n", result);

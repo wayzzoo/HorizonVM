@@ -2,7 +2,8 @@ CC = clang
 TARGET = horizonvm
 
 SOURCES = src/main.c \
-          src/hypervisor/vm.c
+          src/hypervisor/vm.c \
+		  src/hypervisor/vcpu.c
 
 CFLAGS = -Wall -Wextra -Iinclude
 LDFLAGS = -framework Hypervisor
