@@ -5,6 +5,10 @@
 #include <stdint.h>
 #include <mach/mach_time.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct {
     uint64_t start_ticks;
     mach_timebase_info_data_t timebase;
@@ -20,5 +24,8 @@ bool hvm_timer_read(
     uint32_t *value
 );
 
+#ifdef __cplusplus
+}
+#endif
 
 #endif

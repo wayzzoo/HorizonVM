@@ -14,6 +14,7 @@
 #include <hypervisor/vcpu.h>
 #include <hypervisor/memory.h>
 #include <platform/tegra210.h>
+#include <devices/mmio.h>
 
 int main(void) {
     printf("HorizonVM - Apple Silicon Hypervisor\n");
@@ -112,7 +113,7 @@ int main(void) {
         return 1;
     }
 
-    const uint64_t mmio_base = 0x50000000;
+    const uint64_t mmio_base = T210_TIMER_BASE + T210_TIMERUS_CNTR;
 
     result = hv_vcpu_set_reg(cpu.handle, HV_REG_X3, mmio_base);
 
@@ -128,6 +129,16 @@ int main(void) {
 
     printf("[HVM] Starting guest execution at 0x%llx\n", (unsigned long long)guest_base);
 
+
+    hvm_mmio_t mmio = {0};
+
+    if(!hvm_mmio_init(&mmio)) {
+        fprintf(stderr, "[HVM] MMIO initialization failed\n");
+        hvm_memory_destroy(&memory);
+        hvm_vcpu_destroy(&cpu);
+        hvm_vm_destroy();
+        return 1;
+    }
 
     result = hv_vcpu_run(cpu.handle);
 
@@ -163,14 +174,21 @@ int main(void) {
         printf("[HVM] Exception class: 0x%02X\n", ec);
         printf("[HVM] Fault IPA: 0x%llx\n",(unsigned long long)physical);
 
-        if ((ec == 0x24 || ec == 0x25) && physical == mmio_base) {
-            printf("[HVM] MMIO trap PASSED\n");
-            mmio_passed = true;
-        } else {
-            printf("[HVM] Unexpected exception\n");
-        }
+        if ((ec == 0x24 || ec == 0x25) &&
+            physical == mmio_base) {
+
+            uint32_t value = 0;
+
+            if (hvm_mmio_read32(&mmio, physical, &value)) {
+                printf("[HVM] Tegra timer read: %u us\n", value);
+                printf("[HVM] Timer MMIO dispatch PASSED\n");
+                mmio_passed = true;
+            } else {
+                printf("[HVM] Timer MMIO read failed\n");
+            }
+            }
     } else {
-        printf("[HVM] Unexpected exit reason: %d\n",cpu.exit_info->reason);
+        printf("[HVM] Unexpected exception\n");
     }
 
     result = hvm_memory_destroy(&memory);

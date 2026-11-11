@@ -16,7 +16,8 @@ C_SOURCES = \
     src/devices/timer.c
 
 CPP_SOURCES = \
-    src/platform/tegra210.cpp
+    src/platform/tegra210.cpp \
+	src/devices/mmio.cpp
 
 OBJECTS = $(patsubst %.c,build/%.o,$(C_SOURCES)) \
           $(patsubst %.cpp,build/%.o,$(CPP_SOURCES))
