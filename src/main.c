@@ -13,10 +13,18 @@
 #include <hypervisor/vm.h>
 #include <hypervisor/vcpu.h>
 #include <hypervisor/memory.h>
+#include <hypervisor/probe.h>
 #include <platform/tegra210.h>
 #include <devices/mmio.h>
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "--probe") == 0) {
+        return hvm_probe();
+    }
+    if (argc != 1) {
+        fprintf(stderr, "Usage: %s [--probe]\n", argv[0]);
+        return EXIT_FAILURE;
+    }
     printf("HorizonVM - Apple Silicon Hypervisor\n");
 
     hv_return_t result = hvm_vm_create();

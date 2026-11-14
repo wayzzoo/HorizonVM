@@ -10,6 +10,7 @@ LDFLAGS = -framework Hypervisor
 
 C_SOURCES = \
     src/main.c \
+    src/hypervisor/probe.c \
     src/hypervisor/vm.c \
     src/hypervisor/vcpu.c \
     src/hypervisor/memory.c \
@@ -22,7 +23,7 @@ CPP_SOURCES = \
 OBJECTS = $(patsubst %.c,build/%.o,$(C_SOURCES)) \
           $(patsubst %.cpp,build/%.o,$(CPP_SOURCES))
 
-.PHONY: all run clean
+.PHONY: all run probe clean
 
 all: $(TARGET)
 
@@ -40,6 +41,9 @@ build/%.o: %.cpp
 
 run: all
 	./$(TARGET)
+
+probe: all
+	./$(TARGET) --probe
 
 clean:
 	rm -rf build $(TARGET)
