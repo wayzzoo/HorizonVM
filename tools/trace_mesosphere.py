@@ -93,7 +93,7 @@ class GdbRemote:
             raise RuntimeError(f"unexpected QEMU stop: {response}")
 
 
-def trace(image_path, timeout, native, mmu_offset, handoff_offset, kernel_offset, secondary_offset, main_offset, smp_offset, verify_barrier, write0_offset, timer_smoke, svc_offset, ipc_probe):
+def trace(image_path, timeout, native, mmu_offset, handoff_offset, kernel_offset, secondary_offset, main_offset, smp_offset, verify_barrier, write0_offset, timer_smoke, svc_offset, probe_kind):
     with image_path.open("rb") as file:
         image = file.read(MAX_IMAGE_SIZE + 1)
     if len(image) > MAX_IMAGE_SIZE:
@@ -138,7 +138,7 @@ def trace(image_path, timeout, native, mmu_offset, handoff_offset, kernel_offset
     print(f"Image SHA-256: {hashlib.sha256(image).hexdigest()}", flush=True)
     if native is not None:
         command = [str(native.resolve()), "--trace-loader",
-                   *(hex(value) for value in (len(image), layout, ini, loader, target, mmu_stop, handoff, kernel_offset, secondary_offset, main_offset, smp_offset, write0_offset, timer_smoke, svc_offset, ipc_probe))]
+                   *(hex(value) for value in (len(image), layout, ini, loader, target, mmu_stop, handoff, kernel_offset, secondary_offset, main_offset, smp_offset, write0_offset, timer_smoke, svc_offset, probe_kind))]
         subprocess.run(command, input=image, timeout=timeout, check=True)
         return
 
@@ -210,10 +210,12 @@ def main():
                                 help="run all cores until the first physical timer EOI")
     smp_checkpoint.add_argument("--el0-svc-checkpoint", type=lambda value: int(value, 0), default=0,
                                 metavar="KERNEL_OFFSET", help="verify the EL0 probe at the AArch64 SVC handler")
-    parser.add_argument("--ipc-probe", action="store_true", help="verify the two-process IPC reply")
+    probes = parser.add_mutually_exclusive_group()
+    probes.add_argument("--sm-probe", action="store_true", help="verify Atmosphère SM registration and lookup")
+    probes.add_argument("--ipc-probe", action="store_true", help="verify the two-process IPC reply")
     args = parser.parse_args()
-    if args.ipc_probe and not args.el0_svc_checkpoint:
-        parser.error("--ipc-probe requires --el0-svc-checkpoint")
+    if (args.ipc_probe or args.sm_probe) and not args.el0_svc_checkpoint:
+        parser.error("IPC and SM probes require --el0-svc-checkpoint")
     smp_offset = args.through_barrier or args.smp_checkpoint
     if args.semihost_write0 and not (smp_offset or args.timer_smoke or args.el0_svc_checkpoint):
         parser.error("--semihost-write0 requires an SMP run")
@@ -236,7 +238,7 @@ def main():
     try:
         trace(args.image, args.timeout, args.native, args.through_mmu, args.handoff,
               args.kernel_checkpoint, args.secondary_checkpoint, args.all_cores_entry, smp_offset, bool(args.through_barrier),
-              args.semihost_write0, args.timer_smoke, args.el0_svc_checkpoint, args.ipc_probe)
+              args.semihost_write0, args.timer_smoke, args.el0_svc_checkpoint, 2 if args.sm_probe else int(args.ipc_probe))
     except (OSError, ValueError, RuntimeError, struct.error, subprocess.SubprocessError) as error:
         sys.exit(f"Trace failed: {error}")
 

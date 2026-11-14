@@ -155,6 +155,7 @@ typedef struct {
     uint64_t svc_checkpoint;
     uint64_t svc_offset;
     bool ipc_probe;
+    bool sm_probe;
     uint64_t ipc_server_ttbr;
     uint64_t ipc_client_ttbr;
     bool ipc_reply_seen;
@@ -606,6 +607,25 @@ static bool observe_ipc_syscall(smp_trace_t *smp, hvm_vcpu_t *cpu, unsigned sysc
     return true;
 }
 
+static bool verify_sm_reply(smp_trace_t *smp, hvm_vcpu_t *cpu) {
+    uint64_t tls, session, port;
+    if (!check("read SM session handle", hv_vcpu_get_reg(cpu->handle, HV_REG_X1, &session)) ||
+        !check("read SM port handle", hv_vcpu_get_reg(cpu->handle, HV_REG_X2, &port)) ||
+        !check("read SM TLS", hv_vcpu_get_sys_reg(cpu->handle, HV_SYS_REG_TPIDRRO_EL0, &tls)) ||
+        !tls || (tls & 15) || tls >= (UINT64_C(1) << 39)) {
+        return false;
+    }
+    const uint32_t *reply = translate_guest_va(cpu, smp->memory, smp->ini_memory, tls, 28);
+    if (!reply || reply[0] || reply[1] != 0x80000004 || reply[2] != 0x20 ||
+        reply[3] != session || reply[4] != UINT32_C(0x4f434653) || reply[6] ||
+        !session || !port || session == port) {
+        return false;
+    }
+    printf("[HVM] Atmosphère SM registered and resolved hvm:test, port=%#" PRIx64
+           " session=%#" PRIx64 "\n", port, session);
+    return true;
+}
+
 static bool handle_el0_svc(smp_trace_t *smp, hvm_vcpu_t *cpu, unsigned core, uint64_t esr) {
     if (!smp->svc_checkpoint || esr != UINT64_C(0x5a000482)) {
         return false;
@@ -626,19 +646,19 @@ static bool handle_el0_svc(smp_trace_t *smp, hvm_vcpu_t *cpu, unsigned core, uin
         return false;
     }
     const unsigned syscall = guest_esr & 0xffff;
-    const uint64_t expected_marker = smp->ipc_probe ? 0x4950 : 0x4856;
-    if (smp->ipc_probe && (syscall != 7 || marker != expected_marker)) {
-        if (syscall == 7 && (marker == 0x4951 || marker == 0x4952)) {
+    const uint64_t expected_marker = smp->sm_probe ? 0x534d : smp->ipc_probe ? 0x4950 : 0x4856;
+    if ((smp->ipc_probe || smp->sm_probe) && (syscall != 7 || marker != expected_marker)) {
+        if (syscall == 7 && (marker == 0x4951 || marker == 0x4952 || marker == 0x534e)) {
             uint64_t result;
             if (check("read failed IPC result", hv_vcpu_get_reg(cpu->handle, HV_REG_X1, &result))) {
                 fprintf(stderr, "[HVM] IPC %s validation failed, result=%#" PRIx64 "\n",
-                        marker == 0x4951 ? "client" : "server", result);
+                        marker == 0x4951 ? "client" : marker == 0x4952 ? "server" : "SM probe", result);
             }
             return false;
         }
-        return observe_ipc_syscall(smp, cpu, syscall) && resume_ipc_syscall(cpu);
+        return (!smp->ipc_probe || observe_ipc_syscall(smp, cpu, syscall)) && resume_ipc_syscall(cpu);
     }
-    if (syscall != 7 || marker != expected_marker || (!smp->ipc_probe && (elr & 0xfff) != 8)) {
+    if (syscall != 7 || marker != expected_marker || (!smp->ipc_probe && !smp->sm_probe && (elr & 0xfff) != 8)) {
         fprintf(stderr, "[HVM] Unexpected EL0 SVC state\n");
         return false;
     }
@@ -646,7 +666,8 @@ static bool handle_el0_svc(smp_trace_t *smp, hvm_vcpu_t *cpu, unsigned core, uin
                                                2 * sizeof(uint32_t));
     const uint32_t mov_marker = UINT32_C(0xd2800000) | ((uint32_t)expected_marker << 5);
     if (!code || code[0] != mov_marker || code[1] != UINT32_C(0xd40000e1) ||
-        (smp->ipc_probe && !verify_ipc_reply(smp, cpu))) {
+        (smp->ipc_probe && !verify_ipc_reply(smp, cpu)) ||
+        (smp->sm_probe && !verify_sm_reply(smp, cpu))) {
         fprintf(stderr, "[HVM] EL0 completion validation failed\n");
         return false;
     }
@@ -1053,6 +1074,7 @@ int hvm_trace_loader(char **args) {
     const bool timer_smoke = values[12] == 1;
     const uint64_t svc_offset = values[13];
     const bool ipc_probe = values[14] == 1;
+    const bool sm_probe = values[14] == 2;
     const hv_ipa_t image_base = mmu_stop ? virt_kernel_base : reference_image_base;
     if (size < 32 || size > 64 * 1024 * 1024 ||
         layout < image_base || layout >= ini || ini >= loader ||
@@ -1069,7 +1091,7 @@ int hvm_trace_loader(char **args) {
         (write0_offset && ((!smp_offset && !timer_smoke && !svc_offset) || write0_offset > ini - image_base - 4)) ||
         values[12] > 1 || (timer_smoke && (!main_offset || smp_offset || svc_offset)) ||
         (svc_offset && (!main_offset || smp_offset || svc_offset > ini - image_base - 4)) ||
-        values[14] > 1 || (ipc_probe && !svc_offset)) {
+        values[14] > 2 || ((ipc_probe || sm_probe) && !svc_offset)) {
         return EXIT_FAILURE;
     }
     const size_t page = (size_t)getpagesize();
@@ -1082,7 +1104,7 @@ int hvm_trace_loader(char **args) {
     smp_trace_t smp = {.image_base = image_base, .kernel_end = ini,
                        .ram_end = image_base + rounded_size, .gic_lock = OS_UNFAIR_LOCK_INIT,
                        .memory = &memory, .ini_memory = &ini_header,
-                       .timer_smoke = timer_smoke, .svc_offset = svc_offset, .ipc_probe = ipc_probe};
+                       .timer_smoke = timer_smoke, .svc_offset = svc_offset, .ipc_probe = ipc_probe, .sm_probe = sm_probe};
     atomic_init(&smp.stop_observed, false);
     if (!check("create VM", hvm_vm_create())) {
         return EXIT_FAILURE;
@@ -1114,9 +1136,9 @@ int hvm_trace_loader(char **args) {
             }
             memcpy(&ini_size, header + 4, 4);
             memcpy(&processes, header + 8, 4);
-            const uint32_t expected_processes = ipc_probe ? 2 : 1;
-            if (processes != expected_processes || ini_size <= sizeof(empty_ini) || ini_size > page || ini_size > loader - ini) {
-                fprintf(stderr, "[HVM] EL0 trace requires its expected KIP count in one INI1 page\n");
+            const uint32_t expected_processes = ipc_probe || sm_probe ? 2 : 1;
+            if (processes != expected_processes || ini_size <= sizeof(empty_ini) || ini_size > (sm_probe ? virt_ini_reserve : page) || ini_size > loader - ini) {
+                fprintf(stderr, "[HVM] EL0 trace requires its expected KIP count and a backed INI1 range\n");
                 goto cleanup;
             }
         } else if (memcmp(header, "INI1", 4) == 0 &&

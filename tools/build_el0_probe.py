@@ -37,22 +37,36 @@ def el0_kips():
     return [make_kip(text, b"HvmEl0Probe", 0x010000000000FF01, 32, (7,))]
 
 
-def ipc_kips(prefix):
-    tools_directory = Path(__file__).resolve().parent
-    with tempfile.TemporaryDirectory(prefix="hvm-ipc-") as directory:
+def assemble_probe(name, prefix):
+    source = Path(__file__).resolve().parent / f"{name}.s"
+    with tempfile.TemporaryDirectory(prefix="hvm-probe-") as directory:
         obj = Path(directory) / "probe.o"
         binary = Path(directory) / "probe.bin"
+        subprocess.run([prefix + "as", "-o", str(obj), str(source)], check=True)
+        subprocess.run([prefix + "objcopy", "-O", "binary", "-j", ".text",
+                        str(obj), str(binary)], check=True)
+        return binary.read_bytes()
 
-        def assemble(name):
-            source = tools_directory / f"ipc_{name}.s"
-            subprocess.run([prefix + "as", "-o", str(obj), str(source)], check=True)
-            subprocess.run([prefix + "objcopy", "-O", "binary", "-j", ".text", str(obj), str(binary)], check=True)
-            return binary.read_bytes()
 
-        return [
-            make_kip(assemble("server"), b"HvmIpcServer", 0x010000000000FF02, 30, (7, 0x41, 0x43, 0x71)),
-            make_kip(assemble("client"), b"HvmIpcClient", 0x010000000000FF03, 32, (7, 0x1F, 0x21)),
-        ]
+def ipc_kips(prefix):
+    return [
+        make_kip(assemble_probe("ipc_server", prefix), b"HvmIpcServer",
+                 0x010000000000FF02, 30, (7, 0x41, 0x43, 0x71)),
+        make_kip(assemble_probe("ipc_client", prefix), b"HvmIpcClient",
+                 0x010000000000FF03, 32, (7, 0x1F, 0x21)),
+    ]
+
+
+def sm_kips(path, prefix):
+    sm = path.read_bytes()
+    if len(sm) < 0x100 or sm[:4] != b"KIP1" or struct.unpack_from("<Q", sm, 0x10)[0] != 0x0100000000000004:
+        raise ValueError("expected Atmosphère's sm.kip with program ID 0100000000000004")
+    stored_size = sum(struct.unpack_from("<I", sm, off)[0] for off in (0x28, 0x38, 0x48))
+    if len(sm) != 0x100 + stored_size:
+        raise ValueError("SM KIP segment sizes do not match the file")
+    client = make_kip(assemble_probe("sm_probe", prefix), b"HvmSmProbe",
+                      0x010000000000FF04, 32, (7, 0x0B, 0x1F, 0x21))
+    return [sm, client]
 
 
 def insert_probe(image, kips):
@@ -72,8 +86,12 @@ def insert_probe(image, kips):
         raise ValueError("invalid INI1 or loader offset")
     payload = b"".join(kips)
     ini1 = struct.pack("<4sIII", b"INI1", 16 + len(payload), len(kips), 0) + payload
-    if len(ini1) > loader - ini or any(image[ini:loader]):
-        raise ValueError("probe requires an unused INI1 area")
+    if len(ini1) > 12 * 1024 * 1024 or any(image[ini:loader]):
+        raise ValueError("probe requires an unused INI1 area within the board's 12 MiB limit")
+    new_loader = (ini + len(ini1) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)
+    if new_loader > loader:
+        image[loader:loader] = bytes(new_loader - loader)
+        struct.pack_into("<Q", image, metadata + 8, new_loader - (metadata + 8))
     image[ini:ini + len(ini1)] = ini1
     return image
 
@@ -82,7 +100,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image", type=Path)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--ipc", action="store_true", help="build the two-process IPC probe")
+    variants = parser.add_mutually_exclusive_group()
+    variants.add_argument("--sm-kip", type=Path, help="boot Atmosphère sm.kip and a registry probe")
+    variants.add_argument("--ipc", action="store_true", help="build the two-process IPC probe")
     parser.add_argument("--tool-prefix", default="aarch64-none-elf-",
                         help="GNU assembler and objcopy prefix for --ipc")
     args = parser.parse_args()
@@ -91,7 +111,10 @@ def main():
             args.output.exists() and args.image.samefile(args.output)
         ):
             raise ValueError("choose a separate output file")
-        kips = ipc_kips(args.tool_prefix) if args.ipc else el0_kips()
+        if args.sm_kip is not None:
+            kips = sm_kips(args.sm_kip, args.tool_prefix)
+        else:
+            kips = ipc_kips(args.tool_prefix) if args.ipc else el0_kips()
         args.output.write_bytes(insert_probe(bytearray(args.image.read_bytes()), kips))
     except (OSError, ValueError, struct.error, subprocess.CalledProcessError) as error:
         parser.exit(1, f"Cannot build EL0 probe: {error}\n")
