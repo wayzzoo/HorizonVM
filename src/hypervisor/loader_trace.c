@@ -154,6 +154,10 @@ typedef struct {
     bool timer_smoke;
     uint64_t svc_checkpoint;
     uint64_t svc_offset;
+    bool ipc_probe;
+    uint64_t ipc_server_ttbr;
+    uint64_t ipc_client_ttbr;
+    bool ipc_reply_seen;
     atomic_bool stop_observed;
     const hvm_memory_t *memory;
     const hvm_memory_t *ini_memory;
@@ -532,7 +536,77 @@ static bool service_wfi(smp_trace_t *smp, hvm_vcpu_t *cpu, unsigned core, uint64
            check("advance after WFI", hv_vcpu_set_reg(cpu->handle, HV_REG_PC, pc + 4));
 }
 
-static bool observe_el0_svc(smp_trace_t *smp, hvm_vcpu_t *cpu, unsigned core, uint64_t esr) {
+/* The marker replaced "sub sp, sp, #0x120" at the handler entry.
+   Reproduce that one instruction and let Mesosphère dispatch ordinary SVCs. */
+static bool resume_ipc_syscall(hvm_vcpu_t *cpu) {
+    uint64_t sp;
+    return check("read exception stack", hv_vcpu_get_sys_reg(cpu->handle, HV_SYS_REG_SP_EL1, &sp)) &&
+           sp >= UINT64_C(0xffffff8000000120) && !(sp & 15) &&
+           check("restore SVC frame setup", hv_vcpu_set_sys_reg(cpu->handle, HV_SYS_REG_SP_EL1, sp - 0x120));
+}
+
+static const uint32_t *ipc_tls_words(smp_trace_t *smp, hvm_vcpu_t *cpu, uint64_t *tls) {
+    if (!check("read IPC TLS", hv_vcpu_get_sys_reg(cpu->handle, HV_SYS_REG_TPIDRRO_EL0, tls)) ||
+        !*tls || (*tls & 0xf) || *tls >= (UINT64_C(1) << 39)) {
+        return NULL;
+    }
+    return translate_guest_va(cpu, smp->memory, smp->ini_memory, *tls, 3 * sizeof(uint32_t));
+}
+
+static bool verify_ipc_reply(smp_trace_t *smp, hvm_vcpu_t *cpu) {
+    uint64_t tls, reply_register, ttbr;
+    if (!check("read reply word", hv_vcpu_get_reg(cpu->handle, HV_REG_X1, &reply_register)) ||
+        !check("read client page table", hv_vcpu_get_sys_reg(cpu->handle, HV_SYS_REG_TTBR0_EL1, &ttbr)) ||
+        reply_register != UINT64_C(0xb791f3dd)) {
+        return false;
+    }
+    const uint32_t *message = ipc_tls_words(smp, cpu, &tls);
+    os_unfair_lock_lock(&smp->gic_lock);
+    const uint64_t server = smp->ipc_server_ttbr, client = smp->ipc_client_ttbr;
+    const bool observed = smp->ipc_reply_seen && server && client == ttbr &&
+                          ((server ^ client) & UINT64_C(0xfffffffff000));
+    os_unfair_lock_unlock(&smp->gic_lock);
+    if (!observed || !message || message[0] != 0 || message[1] != 1 ||
+        message[2] != UINT32_C(0xb791f3dd)) {
+        return false;
+    }
+    printf("[HVM] IPC round trip verified, server TTBR0=%#" PRIx64 " client TTBR0=%#" PRIx64
+           " client TLS=%#" PRIx64 " reply=0xb791f3dd\n", server, client, tls);
+    return true;
+}
+
+static bool observe_ipc_syscall(smp_trace_t *smp, hvm_vcpu_t *cpu, unsigned syscall) {
+    if (syscall != 0x71 && syscall != 0x21 && syscall != 0x43) {
+        return true;
+    }
+    uint64_t ttbr, reply_target = 0;
+    if (!check("read IPC process page table", hv_vcpu_get_sys_reg(cpu->handle, HV_SYS_REG_TTBR0_EL1, &ttbr)) ||
+        (syscall == 0x43 && !check("read IPC reply handle", hv_vcpu_get_reg(cpu->handle, HV_REG_X3, &reply_target)))) {
+        return false;
+    }
+    if (syscall == 0x21 || reply_target) {
+        uint64_t tls;
+        const uint32_t *message = ipc_tls_words(smp, cpu, &tls);
+        const bool request = syscall == 0x21;
+        if (!message || message[0] != (request ? 4u : 0u) || message[1] != 1 ||
+            message[2] != (request ? UINT32_C(0x12345678) : UINT32_C(0xb791f3dd))) {
+            fprintf(stderr, "[HVM] Unexpected IPC %s payload\n", request ? "request" : "reply");
+            return false;
+        }
+    }
+    os_unfair_lock_lock(&smp->gic_lock);
+    if (syscall == 0x71) {
+        smp->ipc_server_ttbr = ttbr;
+    } else if (syscall == 0x21) {
+        smp->ipc_client_ttbr = ttbr;
+    } else if (reply_target && ttbr == smp->ipc_server_ttbr && smp->ipc_client_ttbr) {
+        smp->ipc_reply_seen = true;
+    }
+    os_unfair_lock_unlock(&smp->gic_lock);
+    return true;
+}
+
+static bool handle_el0_svc(smp_trace_t *smp, hvm_vcpu_t *cpu, unsigned core, uint64_t esr) {
     if (!smp->svc_checkpoint || esr != UINT64_C(0x5a000482)) {
         return false;
     }
@@ -545,16 +619,35 @@ static bool observe_el0_svc(smp_trace_t *smp, hvm_vcpu_t *cpu, unsigned core, ui
         !check("read EL0 marker", hv_vcpu_get_reg(cpu->handle, HV_REG_X0, &marker))) {
         return false;
     }
-    if (pc != smp->svc_checkpoint + 4 || guest_esr != UINT64_C(0x56000007) ||
-        (spsr & 0x1f) || elr >= (UINT64_C(1) << 39) || (elr & 0xfff) != 8 ||
-        marker != 0x4856 || !sp || (sp & 15) || sp >= (UINT64_C(1) << 39)) {
+    if (pc != smp->svc_checkpoint + 4 || (guest_esr >> 16) != 0x5600 ||
+        (spsr & 0x1f) || elr < 8 || elr >= (UINT64_C(1) << 39) || (elr & 3) ||
+        !sp || (sp & 15) || sp >= (UINT64_C(1) << 39)) {
+        fprintf(stderr, "[HVM] Unexpected EL0 SVC state\n");
+        return false;
+    }
+    const unsigned syscall = guest_esr & 0xffff;
+    const uint64_t expected_marker = smp->ipc_probe ? 0x4950 : 0x4856;
+    if (smp->ipc_probe && (syscall != 7 || marker != expected_marker)) {
+        if (syscall == 7 && (marker == 0x4951 || marker == 0x4952)) {
+            uint64_t result;
+            if (check("read failed IPC result", hv_vcpu_get_reg(cpu->handle, HV_REG_X1, &result))) {
+                fprintf(stderr, "[HVM] IPC %s validation failed, result=%#" PRIx64 "\n",
+                        marker == 0x4951 ? "client" : "server", result);
+            }
+            return false;
+        }
+        return observe_ipc_syscall(smp, cpu, syscall) && resume_ipc_syscall(cpu);
+    }
+    if (syscall != 7 || marker != expected_marker || (!smp->ipc_probe && (elr & 0xfff) != 8)) {
         fprintf(stderr, "[HVM] Unexpected EL0 SVC state\n");
         return false;
     }
     const uint32_t *code = translate_guest_va(cpu, smp->memory, smp->ini_memory, elr - 8,
                                                2 * sizeof(uint32_t));
-    if (!code || code[0] != UINT32_C(0xd2890ac0) || code[1] != UINT32_C(0xd40000e1)) {
-        fprintf(stderr, "[HVM] User instructions do not match the EL0 probe\n");
+    const uint32_t mov_marker = UINT32_C(0xd2800000) | ((uint32_t)expected_marker << 5);
+    if (!code || code[0] != mov_marker || code[1] != UINT32_C(0xd40000e1) ||
+        (smp->ipc_probe && !verify_ipc_reply(smp, cpu))) {
+        fprintf(stderr, "[HVM] EL0 completion validation failed\n");
         return false;
     }
     printf("[HVM] Core %u observed EL0 SVC #7, guest PC=%#" PRIx64 " SP_EL0=%#" PRIx64
@@ -591,9 +684,8 @@ static bool run_to_smp_checkpoint(hvm_vcpu_t *cpu, smp_trace_t *smp, uint64_t af
         if (!current || current->reason != HV_EXIT_REASON_EXCEPTION || exits == 4096) {
             break;
         }
-        if (observe_el0_svc(smp, cpu, (unsigned)affinity, current->exception.syndrome)) {
-            stopped_after_event = true;
-            break;
+        if (handle_el0_svc(smp, cpu, (unsigned)affinity, current->exception.syndrome)) {
+            continue;
         }
         if (service_gic(smp, cpu, (unsigned)affinity, &current->exception)) {
             ++gic_accesses;
@@ -945,7 +1037,7 @@ static bool trace_handoff(hvm_vcpu_t *cpu, uint64_t handoff, uint64_t link,
 int hvm_trace_loader(char **args) {
     /* Image metadata and SHA-256 are checked by the trace script. The child
        receives exactly the bytes hashed by that script via stdin. */
-    uint64_t values[14];
+    uint64_t values[15];
     for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
         char *end;
         errno = 0;
@@ -960,6 +1052,7 @@ int hvm_trace_loader(char **args) {
     const uint64_t smp_offset = values[10], write0_offset = values[11];
     const bool timer_smoke = values[12] == 1;
     const uint64_t svc_offset = values[13];
+    const bool ipc_probe = values[14] == 1;
     const hv_ipa_t image_base = mmu_stop ? virt_kernel_base : reference_image_base;
     if (size < 32 || size > 64 * 1024 * 1024 ||
         layout < image_base || layout >= ini || ini >= loader ||
@@ -975,7 +1068,8 @@ int hvm_trace_loader(char **args) {
                             smp_offset > ini - image_base - 4)) ||
         (write0_offset && ((!smp_offset && !timer_smoke && !svc_offset) || write0_offset > ini - image_base - 4)) ||
         values[12] > 1 || (timer_smoke && (!main_offset || smp_offset || svc_offset)) ||
-        (svc_offset && (!main_offset || smp_offset || svc_offset > ini - image_base - 4))) {
+        (svc_offset && (!main_offset || smp_offset || svc_offset > ini - image_base - 4)) ||
+        values[14] > 1 || (ipc_probe && !svc_offset)) {
         return EXIT_FAILURE;
     }
     const size_t page = (size_t)getpagesize();
@@ -988,7 +1082,7 @@ int hvm_trace_loader(char **args) {
     smp_trace_t smp = {.image_base = image_base, .kernel_end = ini,
                        .ram_end = image_base + rounded_size, .gic_lock = OS_UNFAIR_LOCK_INIT,
                        .memory = &memory, .ini_memory = &ini_header,
-                       .timer_smoke = timer_smoke, .svc_offset = svc_offset};
+                       .timer_smoke = timer_smoke, .svc_offset = svc_offset, .ipc_probe = ipc_probe};
     atomic_init(&smp.stop_observed, false);
     if (!check("create VM", hvm_vm_create())) {
         return EXIT_FAILURE;
@@ -1020,8 +1114,9 @@ int hvm_trace_loader(char **args) {
             }
             memcpy(&ini_size, header + 4, 4);
             memcpy(&processes, header + 8, 4);
-            if (processes != 1 || ini_size <= sizeof(empty_ini) || ini_size > page || ini_size > loader - ini) {
-                fprintf(stderr, "[HVM] EL0 trace requires a single KIP in one INI1 page\n");
+            const uint32_t expected_processes = ipc_probe ? 2 : 1;
+            if (processes != expected_processes || ini_size <= sizeof(empty_ini) || ini_size > page || ini_size > loader - ini) {
+                fprintf(stderr, "[HVM] EL0 trace requires its expected KIP count in one INI1 page\n");
                 goto cleanup;
             }
         } else if (memcmp(header, "INI1", 4) == 0 &&

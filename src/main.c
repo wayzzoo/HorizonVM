@@ -19,7 +19,7 @@
 #include <devices/mmio.h>
 
 int main(int argc, char **argv) {
-    if (argc == 16 && strcmp(argv[1], "--trace-loader") == 0) {
+    if (argc == 17 && strcmp(argv[1], "--trace-loader") == 0) {
         return hvm_trace_loader(argv + 2);
     }
     if (argc == 2 && strcmp(argv[1], "--probe") == 0) {
