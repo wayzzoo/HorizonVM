@@ -93,7 +93,7 @@ class GdbRemote:
             raise RuntimeError(f"unexpected QEMU stop: {response}")
 
 
-def trace(image_path, timeout, native, mmu_offset, handoff_offset, kernel_offset):
+def trace(image_path, timeout, native, mmu_offset, handoff_offset, kernel_offset, secondary_offset, main_offset, barrier_offset):
     with image_path.open("rb") as file:
         image = file.read(MAX_IMAGE_SIZE + 1)
     if len(image) > MAX_IMAGE_SIZE:
@@ -117,12 +117,23 @@ def trace(image_path, timeout, native, mmu_offset, handoff_offset, kernel_offset
             raise ValueError("handoff checkpoint is outside the loader")
         if struct.unpack_from("<I", image, offset)[0] != 0xd61f0060:
             raise ValueError("handoff checkpoint must point to BR X3")
-    if kernel_offset and (kernel_offset < 0 or kernel_offset & 3 or kernel_offset > ini - base - 4):
-        raise ValueError("checkpoint is outside the kernel")
+    for checkpoint in (kernel_offset, secondary_offset, main_offset, barrier_offset):
+        if checkpoint and (checkpoint < 0 or checkpoint & 3 or checkpoint > ini - base - 4):
+            raise ValueError("checkpoint is outside the kernel")
+    if main_offset and (
+        main_offset > ini - base - 8 or struct.unpack_from("<I", image, main_offset)[0] != 0xa9bd7bfd
+    ):
+        raise ValueError("unexpected HorizonKernelMain prologue")
+    if barrier_offset:
+        if barrier_offset <= main_offset + 4:
+            raise ValueError("barrier checkpoint must follow the kernel entry")
+        call, next_call = struct.unpack_from("<II", image, barrier_offset - 4)
+        if call >> 26 != 0b100101 or next_call != call - 1:
+            raise ValueError("expected adjacent BL instructions to the same barrier function")
     print(f"Image SHA-256: {hashlib.sha256(image).hexdigest()}", flush=True)
     if native is not None:
         command = [str(native.resolve()), "--trace-loader",
-                   *(hex(value) for value in (len(image), layout, ini, loader, target, mmu_stop, handoff, kernel_offset))]
+                   *(hex(value) for value in (len(image), layout, ini, loader, target, mmu_stop, handoff, kernel_offset, secondary_offset, main_offset, barrier_offset))]
         subprocess.run(command, input=image, timeout=timeout, check=True)
         return
 
@@ -179,7 +190,21 @@ def main():
                         help="follow the loader's final BR X3 back to the kernel")
     parser.add_argument("--kernel-checkpoint", type=lambda value: int(value, 0), default=0,
                         metavar="KERNEL_OFFSET", help="follow execution to an offset in the relocated kernel")
+    parser.add_argument("--secondary-checkpoint", type=lambda value: int(value, 0), default=0,
+                        metavar="KERNEL_OFFSET", help="start PSCI secondaries and park them at this kernel offset")
+    parser.add_argument("--all-cores-entry", type=lambda value: int(value, 0), default=0,
+                        metavar="KERNEL_OFFSET", help="continue all cores to the kernel entry after debug setup")
+    parser.add_argument("--through-barrier", type=lambda value: int(value, 0), default=0,
+                        metavar="KERNEL_OFFSET", help="run all cores to the first barrier's return PC")
     args = parser.parse_args()
+    if args.through_barrier and not args.all_cores_entry:
+        parser.error("--through-barrier requires --all-cores-entry")
+    if args.all_cores_entry and (
+        not args.secondary_checkpoint or args.secondary_checkpoint != args.kernel_checkpoint
+    ):
+        parser.error("--all-cores-entry requires the same primary and secondary pre-main checkpoint")
+    if args.secondary_checkpoint and not args.kernel_checkpoint:
+        parser.error("--secondary-checkpoint requires --kernel-checkpoint")
     if args.kernel_checkpoint and args.handoff is None:
         parser.error("--kernel-checkpoint requires --handoff")
     if args.handoff is not None and args.through_mmu is None:
@@ -189,7 +214,7 @@ def main():
     if not 0 < args.timeout < float("inf"):
         parser.error("--timeout must be positive and finite")
     try:
-        trace(args.image, args.timeout, args.native, args.through_mmu, args.handoff, args.kernel_checkpoint)
+        trace(args.image, args.timeout, args.native, args.through_mmu, args.handoff, args.kernel_checkpoint, args.secondary_checkpoint, args.all_cores_entry, args.through_barrier)
     except (OSError, ValueError, RuntimeError, struct.error, subprocess.SubprocessError) as error:
         sys.exit(f"Trace failed: {error}")
 

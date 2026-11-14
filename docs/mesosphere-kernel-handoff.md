@@ -1,5 +1,8 @@
 # Mesosphère loader handoff on Apple M1
 
+The later [four-core trace](mesosphere-four-core-entry.md) handles CPU_ON
+and reaches the first multicore barrier.
+
 The native trace now runs through the loader, verifies 4 KiB stage-1
 translation, follows the relocated kernel handoff, and reaches
 `InitializeCorePhase2`. A later run reached the kernel's first PSCI CPU_ON

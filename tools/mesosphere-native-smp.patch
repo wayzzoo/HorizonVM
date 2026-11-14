@@ -1,0 +1,8 @@
+diff --git a/mesosphere/kernel/source/arch/arm64/init/kern_init_core.cpp b/mesosphere/kernel/source/arch/arm64/init/kern_init_core.cpp
+index e37780b..39a338b 100644
+--- a/mesosphere/kernel/source/arch/arm64/init/kern_init_core.cpp
++++ b/mesosphere/kernel/source/arch/arm64/init/kern_init_core.cpp
+@@ -711,0 +712 @@ namespace ams::kern::init {
++        #if !defined(ATMOSPHERE_BOARD_QEMU_VIRT)
+@@ -712,0 +714 @@ namespace ams::kern::init {
++        #endif
