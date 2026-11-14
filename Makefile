@@ -19,12 +19,13 @@ C_SOURCES = \
 
 CPP_SOURCES = \
     src/platform/tegra210.cpp \
+    src/devices/gicv2.cpp \
 	src/devices/mmio.cpp
 
 OBJECTS = $(patsubst %.c,build/%.o,$(C_SOURCES)) \
           $(patsubst %.cpp,build/%.o,$(CPP_SOURCES))
 
-.PHONY: all run probe clean
+.PHONY: all run probe test-gicv2 clean
 
 all: $(TARGET)
 
@@ -45,6 +46,13 @@ run: all
 
 probe: all
 	./$(TARGET) --probe
+
+test-gicv2: build/test-gicv2
+	./build/test-gicv2
+
+build/test-gicv2: tests/gicv2.cpp src/devices/gicv2.cpp include/devices/gicv2.h
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(filter %.cpp,$^) -o $@
 
 clean:
 	rm -rf build $(TARGET)

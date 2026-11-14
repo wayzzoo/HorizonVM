@@ -1,4 +1,5 @@
 #include "hypervisor/loader_trace.h"
+#include "devices/gicv2.h"
 #include "hypervisor/memory.h"
 #include "hypervisor/vcpu.h"
 #include "hypervisor/vm.h"
@@ -7,6 +8,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <libkern/OSCacheControl.h>
+#include <os/lock.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -96,14 +98,17 @@ static bool snapshot(hvm_vcpu_t *cpu, const char *label, uint64_t expected_pc,
 /* The M1 framework traps reads of CNTPCT_EL0 to the host. QEMU virt's
    Mesosphère build expects a 19.2 MHz counter. Derive it from monotonic
    uptime so reads progress at the advertised board rate. */
+static uint64_t physical_counter_ticks(void) {
+    return (__uint128_t)clock_gettime_nsec_np(CLOCK_UPTIME_RAW) * 19200000 / 1000000000;
+}
+
 static bool service_physical_counter(hvm_vcpu_t *cpu, uint64_t esr) {
     const unsigned rt = (esr >> 5) & 31;
     uint64_t pc;
     if (!check("read trapped instruction PC", hv_vcpu_get_reg(cpu->handle, HV_REG_PC, &pc))) {
         return false;
     }
-    const uint64_t ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    const uint64_t ticks = (__uint128_t)ns * 19200000 / 1000000000;
+    const uint64_t ticks = physical_counter_ticks();
     if (rt != 31 &&
         !check("return CNTPCT_EL0 value", hv_vcpu_set_reg(cpu->handle, HV_REG_X0 + rt, ticks))) {
         return false;
@@ -118,7 +123,7 @@ typedef struct {
     dispatch_group_t owner;
     bool reached_checkpoint;
     bool reached_main;
-    bool passed_barrier;
+    bool reached_smp_checkpoint;
     bool destroyed;
 } secondary_vcpu_t;
 
@@ -129,7 +134,17 @@ typedef struct {
     uint64_t ram_end;
     uint64_t secondary_checkpoint;
     uint64_t main_checkpoint;
-    uint64_t barrier_checkpoint;
+    uint64_t smp_checkpoint;
+    uint64_t write0_pc;
+    const hvm_memory_t *memory;
+    os_unfair_lock gic_lock;
+    dispatch_semaphore_t interrupt_ready[HVM_GICV2_CPUS];
+    hvm_gicv2_t gic;
+    unsigned sgi_acks[HVM_GICV2_CPUS];
+    struct {
+        uint64_t compare;
+        unsigned control;
+    } physical_timer[HVM_GICV2_CPUS];
 } smp_trace_t;
 
 static bool service_cpu_on(smp_trace_t *smp, hvm_vcpu_t *primary);
@@ -221,18 +236,211 @@ static bool run_to_main(hvm_vcpu_t *cpu, uint64_t address, uint64_t affinity) {
            exit->exception.syndrome == UINT64_C(0x5a000480);
 }
 
-static bool run_through_barrier(hvm_vcpu_t *cpu, const smp_trace_t *smp, uint64_t affinity) {
-    uint64_t pc, state, regs[4];
-    if (!check("resume at restored kernel instruction",
-               hv_vcpu_set_reg(cpu->handle, HV_REG_PC, smp->main_checkpoint + 4)) ||
-        !run_bounded(cpu)) {
+static bool service_gic(smp_trace_t *smp, hvm_vcpu_t *cpu, unsigned core,
+                        const hv_vcpu_exit_exception_t *fault) {
+    const uint64_t esr = fault->syndrome;
+    const uint64_t ipa = fault->physical_address;
+    /* Only emulate a direct stage-2 translation abort with a valid A64
+       load/store syndrome. Host RAM and guest page table walks are separate. */
+    const unsigned fault_status = esr & 0x3f;
+    if (((esr >> 26) & 0x3f) != 0x24 || !(esr & (1u << 24)) ||
+        fault_status < 4 || fault_status > 7 || !(esr & (1u << 25)) ||
+        (esr & ((1u << 21) | (1u << 10) | (1u << 9) | (1u << 8) | (1u << 7)))) {
         return false;
     }
+    const unsigned width = 1u << ((esr >> 22) & 3);
+    const unsigned rt = (esr >> 16) & 31;
+    const bool write = (esr & (1u << 6)) != 0;
+    uint64_t reg = 0, pc;
+    if (write && rt != 31 &&
+        !check("read GIC write operand", hv_vcpu_get_reg(cpu->handle, HV_REG_X0 + rt, &reg))) {
+        return false;
+    }
+    uint32_t value = (uint32_t)reg;
+    os_unfair_lock_lock(&smp->gic_lock);
+    const bool handled = hvm_gicv2_access(&smp->gic, core, ipa, width, write, &value);
+    if (handled && write && ipa == HVM_VIRT_GICD_BASE + 0xf00) {
+        for (unsigned target = 0; target < HVM_GICV2_CPUS; ++target) {
+            if (hvm_gicv2_irq_pending(&smp->gic, target)) {
+                dispatch_semaphore_signal(smp->interrupt_ready[target]);
+            }
+        }
+    }
+    os_unfair_lock_unlock(&smp->gic_lock);
+    if (handled && !write && ipa == HVM_VIRT_GICC_BASE + 0xc && (value & 0x3ff) < 16) {
+        ++smp->sgi_acks[core];
+    }
+    if (!handled) {
+        return false;
+    }
+    return (write || rt == 31 ||
+            check("return GIC read value", hv_vcpu_set_reg(cpu->handle, HV_REG_X0 + rt, value))) &&
+           check("read GIC access PC", hv_vcpu_get_reg(cpu->handle, HV_REG_PC, &pc)) &&
+           check("resume after GIC access", hv_vcpu_set_reg(cpu->handle, HV_REG_PC, pc + 4));
+}
+
+static bool service_physical_timer(smp_trace_t *smp, hvm_vcpu_t *cpu,
+                                   unsigned core, uint64_t esr) {
+    const uint64_t access = esr & ~(UINT64_C(31) << 5);
+    if (access == UINT64_C(0x6232f801)) {
+        return service_physical_counter(cpu, esr);
+    }
+    const bool read = (access & 1) != 0;
+    const bool control = (access & ~UINT64_C(1)) == UINT64_C(0x6232f804);
+    const bool compare = (access & ~UINT64_C(1)) == UINT64_C(0x6234f804);
+    if (!control && !compare) {
+        return false;
+    }
+    const unsigned rt = (esr >> 5) & 31;
+    uint64_t value = 0, pc;
+    if (read) {
+        if (control) {
+            value = smp->physical_timer[core].control;
+            if ((value & 1) && physical_counter_ticks() >= smp->physical_timer[core].compare) {
+                value |= 4;  /* ISTATUS */
+            }
+        } else {
+            value = smp->physical_timer[core].compare;
+        }
+        if (rt != 31 && !check("return physical timer value",
+                               hv_vcpu_set_reg(cpu->handle, HV_REG_X0 + rt, value))) {
+            return false;
+        }
+    } else {
+        if (rt != 31 && !check("read physical timer operand",
+                               hv_vcpu_get_reg(cpu->handle, HV_REG_X0 + rt, &value))) {
+            return false;
+        }
+        if (control) {
+            if ((value & 3) == 1) {
+                fprintf(stderr, "[HVM] Physical timer interrupt delivery is not implemented\n");
+                return false;
+            }
+            smp->physical_timer[core].control = value & 3;
+        } else {
+            smp->physical_timer[core].compare = value;
+        }
+    }
+    return check("read trapped timer PC", hv_vcpu_get_reg(cpu->handle, HV_REG_PC, &pc)) &&
+           check("resume after physical timer access", hv_vcpu_set_reg(cpu->handle, HV_REG_PC, pc + 4));
+}
+
+static void *translate_kernel_va(hvm_vcpu_t *cpu, const hvm_memory_t *memory,
+                                 uint64_t va, size_t width);
+
+static bool service_write0(smp_trace_t *smp, hvm_vcpu_t *cpu, uint64_t esr) {
+    if (!smp->write0_pc || esr != UINT64_C(0x5a00f000)) {
+        return false;
+    }
+    uint64_t pc, operation, address;
+    if (!check("read semihosting PC", hv_vcpu_get_reg(cpu->handle, HV_REG_PC, &pc)) ||
+        !check("read semihosting operation", hv_vcpu_get_reg(cpu->handle, HV_REG_X0, &operation)) ||
+        !check("read semihosting string", hv_vcpu_get_reg(cpu->handle, HV_REG_X1, &address)) ||
+        pc != smp->write0_pc + 4 || operation != 4 || address < UINT64_C(0xffffff8000000000)) {
+        return false;
+    }
+    char line[1024];
+    size_t count = 0;
+    while (count < sizeof(line)) {
+        if (address > UINT64_MAX - count) {
+            return false;
+        }
+        const uint64_t cursor = address + count;
+        size_t chunk = 4096 - (cursor & 4095);
+        if (chunk > sizeof(line) - count) {
+            chunk = sizeof(line) - count;
+        }
+        const char *source = translate_kernel_va(cpu, smp->memory, cursor, chunk);
+        if (!source) {
+            return false;
+        }
+        const char *end = memchr(source, '\0', chunk);
+        const size_t length = end ? (size_t)(end - source) : chunk;
+        memcpy(line + count, source, length);
+        count += length;
+        if (end) {
+            flockfile(stdout);
+            fputs("[Mesosphère] ", stdout);
+            for (size_t i = 0; i < count; ++i) {
+                const unsigned char c = (unsigned char)line[i];
+                putchar(c == '\n' || c == '\t' || (c >= 32 && c < 127) ? c : '?');
+            }
+            if (!count || line[count - 1] != '\n') {
+                putchar('\n');
+            }
+            funlockfile(stdout);
+            return true;
+        }
+    }
+    fprintf(stderr, "[HVM] Unterminated semihosting string\n");
+    return false;
+}
+
+static bool irq_pending(smp_trace_t *smp, unsigned core) {
+    os_unfair_lock_lock(&smp->gic_lock);
+    const bool pending = hvm_gicv2_irq_pending(&smp->gic, core);
+    os_unfair_lock_unlock(&smp->gic_lock);
+    return pending;
+}
+
+static bool service_wfi(smp_trace_t *smp, hvm_vcpu_t *cpu, unsigned core, uint64_t esr) {
+    if (esr != UINT64_C(0x07e00000)) {
+        return false;
+    }
+    /* WFI wakes on an asserted IRQ even if guest PSTATE masks exceptions. */
+    const dispatch_time_t deadline = dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC);
+    while (!irq_pending(smp, core)) {
+        if (dispatch_semaphore_wait(smp->interrupt_ready[core], deadline)) {
+            fprintf(stderr, "[HVM] Core %u waited for an interrupt at WFI\n", core);
+            return false;
+        }
+    }
+    uint64_t pc;
+    return check("read WFI PC", hv_vcpu_get_reg(cpu->handle, HV_REG_PC, &pc)) &&
+           check("advance after WFI", hv_vcpu_set_reg(cpu->handle, HV_REG_PC, pc + 4));
+}
+
+static bool run_to_smp_checkpoint(hvm_vcpu_t *cpu, smp_trace_t *smp, uint64_t affinity) {
+    uint64_t pc, state, regs[4];
+    if (!check("resume at restored kernel instruction",
+               hv_vcpu_set_reg(cpu->handle, HV_REG_PC, smp->main_checkpoint + 4))) {
+        return false;
+    }
+    size_t gic_accesses = 0, timer_accesses = 0, console_writes = 0, waits = 0;
+    while (true) {
+        if (!check("set GIC IRQ line", hv_vcpu_set_pending_interrupt(cpu->handle, HV_INTERRUPT_TYPE_IRQ,
+                                                                    irq_pending(smp, (unsigned)affinity))) ||
+            !run_bounded(cpu)) {
+            return false;
+        }
+        const hv_vcpu_exit_t *current = cpu->exit_info;
+        if (!current || current->reason != HV_EXIT_REASON_EXCEPTION || gic_accesses + timer_accesses + console_writes + waits == 4096) {
+            break;
+        }
+        if (service_gic(smp, cpu, (unsigned)affinity, &current->exception)) {
+            ++gic_accesses;
+            continue;
+        }
+        if (service_physical_timer(smp, cpu, (unsigned)affinity, current->exception.syndrome)) {
+            ++timer_accesses;
+            continue;
+        }
+        if (service_write0(smp, cpu, current->exception.syndrome)) {
+            ++console_writes;
+            continue;
+        }
+        if (service_wfi(smp, cpu, (unsigned)affinity, current->exception.syndrome)) {
+            ++waits;
+            continue;
+        }
+        break;
+    }
     const hv_vcpu_exit_t *exit = cpu->exit_info;
-    const uint64_t expected_pc = smp->barrier_checkpoint + 4;
+    const uint64_t expected_pc = smp->smp_checkpoint + 4;
     flockfile(stdout);
-    printf("[HVM] Core %" PRIu64 " barrier trace\n", affinity);
-    const bool read_state = snapshot(cpu, "First multicore barrier passed", expected_pc,
+    printf("[HVM] Core %" PRIu64 " checkpoint trace, GIC accesses=%zu, timer accesses=%zu, SGI acknowledgements=%u\n",
+           affinity, gic_accesses, timer_accesses, smp->sgi_acks[affinity]);
+    const bool read_state = snapshot(cpu, "SMP checkpoint reached", expected_pc,
                                      &pc, &state, regs);
     if (exit && exit->reason == HV_EXIT_REASON_EXCEPTION) {
         printf(" syndrome=%#" PRIx64 " VA=%#" PRIx64 " IPA=%#" PRIx64 "\n",
@@ -295,8 +503,8 @@ static bool service_cpu_on(smp_trace_t *smp, hvm_vcpu_t *primary) {
                 slot->reached_main = run_to_main(&secondary, smp->main_checkpoint, affinity);
                 dispatch_semaphore_signal(slot->complete);
                 dispatch_semaphore_wait(slot->release, DISPATCH_TIME_FOREVER);
-                if (smp->barrier_checkpoint) {
-                    slot->passed_barrier = run_through_barrier(&secondary, smp, affinity);
+                if (smp->smp_checkpoint) {
+                    slot->reached_smp_checkpoint = run_to_smp_checkpoint(&secondary, smp, affinity);
                     dispatch_semaphore_signal(slot->complete);
                     dispatch_semaphore_wait(slot->release, DISPATCH_TIME_FOREVER);
                 }
@@ -342,7 +550,8 @@ static void *ram_pointer(const hvm_memory_t *memory, uint64_t ipa, size_t width)
 
 /* Walk the loader's 39-bit TTBR1 translation to locate the instruction in
    stage-2 RAM after the guest has randomized its kernel pages. */
-static uint32_t *main_instruction(hvm_vcpu_t *cpu, const hvm_memory_t *memory, uint64_t va) {
+static void *translate_kernel_va(hvm_vcpu_t *cpu, const hvm_memory_t *memory,
+                                 uint64_t va, size_t width) {
     const uint64_t address_mask = UINT64_C(0xfffffffff000);
     uint64_t tcr, table;
     if (!check("read TTBR1 granule", hv_vcpu_get_sys_reg(cpu->handle, HV_SYS_REG_TCR_EL1, &tcr)) ||
@@ -360,14 +569,32 @@ static uint32_t *main_instruction(hvm_vcpu_t *cpu, const hvm_memory_t *memory, u
         if (shift == 12 || !(table & 2)) {
             const uint64_t offset_mask = (UINT64_C(1) << shift) - 1;
             const uint64_t ipa = (table & address_mask & ~offset_mask) | (va & offset_mask);
-            return ram_pointer(memory, ipa, sizeof(uint32_t));
+            return ram_pointer(memory, ipa, width);
         }
     }
     return NULL;
 }
 
+static uint32_t *main_instruction(hvm_vcpu_t *cpu, const hvm_memory_t *memory, uint64_t va) {
+    return translate_kernel_va(cpu, memory, va, sizeof(uint32_t));
+}
+
+static void print_kernel_fault_instruction(hvm_vcpu_t *cpu, const hvm_memory_t *memory) {
+    uint64_t elr, esr;
+    if (!check("read guest fault syndrome", hv_vcpu_get_sys_reg(cpu->handle, HV_SYS_REG_ESR_EL1, &esr)) ||
+        !check("read guest fault PC", hv_vcpu_get_sys_reg(cpu->handle, HV_SYS_REG_ELR_EL1, &elr)) ||
+        !esr || elr < UINT64_C(0xffffff8000000000) || (elr & 3)) {
+        return;
+    }
+    const uint32_t *instruction = main_instruction(cpu, memory, elr);
+    if (instruction) {
+        printf("[HVM] Primary guest fault instruction at %#" PRIx64 ": %#010" PRIx32 "\n",
+               elr, *instruction);
+    }
+}
+
 static bool trace_main_all(hvm_vcpu_t *cpu, smp_trace_t *smp,
-                           const hvm_memory_t *memory, uint64_t address, uint64_t barrier) {
+                           const hvm_memory_t *memory, uint64_t address, uint64_t checkpoint, uint64_t write0) {
     for (size_t i = 0; i < sizeof(smp->secondary) / sizeof(smp->secondary[0]); i++) {
         if (!smp->secondary[i].reached_checkpoint) {
             fprintf(stderr, "[HVM] All secondary vCPUs must reach the pre-main checkpoint\n");
@@ -398,36 +625,61 @@ static bool trace_main_all(hvm_vcpu_t *cpu, smp_trace_t *smp,
     }
     *instruction = original;
     sys_icache_invalidate(instruction, sizeof(*instruction));
-    if (!ok || !barrier) {
+    if (!ok || !checkpoint) {
         return ok;
     }
 
-    uint32_t *after_barrier = main_instruction(cpu, memory, barrier);
-    if (!after_barrier) {
-        fprintf(stderr, "[HVM] Could not translate the first barrier's return PC\n");
+    uint32_t *checkpoint_instruction = main_instruction(cpu, memory, checkpoint);
+    if (!checkpoint_instruction) {
+        fprintf(stderr, "[HVM] Could not translate the SMP checkpoint\n");
         return false;
     }
-    const uint32_t saved = *after_barrier;
-    *after_barrier = UINT32_C(0xd4009022);  /* HVC #0x481 */
-    sys_icache_invalidate(after_barrier, sizeof(*after_barrier));
-    smp->barrier_checkpoint = barrier;
+    uint32_t *console = NULL;
+    if (write0) {
+        console = main_instruction(cpu, memory, write0);
+        if (!console || *console != UINT32_C(0xd45e0000) || console == checkpoint_instruction) {
+            fprintf(stderr, "[HVM] Invalid semihosting instruction\n");
+            return false;
+        }
+        *console = UINT32_C(0xd41e0002);  /* HVC #0xf000 */
+        sys_icache_invalidate(console, sizeof(*console));
+        smp->write0_pc = write0;
+    }
+    const uint32_t saved = *checkpoint_instruction;
+    *checkpoint_instruction = UINT32_C(0xd4009022);  /* HVC #0x481 */
+    sys_icache_invalidate(checkpoint_instruction, sizeof(*checkpoint_instruction));
+    smp->smp_checkpoint = checkpoint;
+    for (unsigned core = 0; core < HVM_GICV2_CPUS; ++core) {
+        smp->interrupt_ready[core] = dispatch_semaphore_create(0);
+    }
     for (size_t i = 0; i < sizeof(smp->secondary) / sizeof(smp->secondary[0]); i++) {
         dispatch_semaphore_signal(smp->secondary[i].release);
     }
-    ok = run_through_barrier(cpu, smp, 0);
+    ok = run_to_smp_checkpoint(cpu, smp, 0);
     for (size_t i = 0; i < sizeof(smp->secondary) / sizeof(smp->secondary[0]); i++) {
         secondary_vcpu_t *slot = &smp->secondary[i];
         dispatch_semaphore_wait(slot->complete, DISPATCH_TIME_FOREVER);
-        ok = slot->passed_barrier && ok;
+        ok = slot->reached_smp_checkpoint && ok;
     }
-    *after_barrier = saved;
-    sys_icache_invalidate(after_barrier, sizeof(*after_barrier));
+    for (unsigned core = 0; core < HVM_GICV2_CPUS; ++core) {
+        dispatch_release(smp->interrupt_ready[core]);
+    }
+    if (!ok) {
+        print_kernel_fault_instruction(cpu, memory);
+    }
+    *checkpoint_instruction = saved;
+    sys_icache_invalidate(checkpoint_instruction, sizeof(*checkpoint_instruction));
+    if (console) {
+        *console = UINT32_C(0xd45e0000);
+        sys_icache_invalidate(console, sizeof(*console));
+    }
     return ok;
 }
 
 static bool trace_handoff(hvm_vcpu_t *cpu, uint64_t handoff, uint64_t link,
                           uint64_t image_base, uint64_t image_end, uint64_t kernel_offset,
-                          uint64_t secondary_offset, uint64_t main_offset, uint64_t barrier_offset, smp_trace_t *smp,
+                          uint64_t secondary_offset, uint64_t main_offset, uint64_t smp_offset, uint64_t write0_offset,
+                          smp_trace_t *smp,
                           const hvm_memory_t *memory) {
     uint64_t before[4], after[4], destination, par, sp;
     if (!run_to_breakpoint(cpu, "Loader handoff branch", handoff, before, true, NULL) ||
@@ -469,7 +721,8 @@ static bool trace_handoff(hvm_vcpu_t *cpu, uint64_t handoff, uint64_t link,
             return false;
         }
         return !main_offset || trace_main_all(cpu, smp, memory, virtual_base + main_offset,
-                                              barrier_offset ? virtual_base + barrier_offset : 0);
+                                              smp_offset ? virtual_base + smp_offset : 0,
+                                              write0_offset ? virtual_base + write0_offset : 0);
     }
     return true;
 }
@@ -477,7 +730,7 @@ static bool trace_handoff(hvm_vcpu_t *cpu, uint64_t handoff, uint64_t link,
 int hvm_trace_loader(char **args) {
     /* Image metadata and SHA-256 are checked by the trace script. The child
        receives exactly the bytes hashed by that script via stdin. */
-    uint64_t values[11];
+    uint64_t values[12];
     for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
         char *end;
         errno = 0;
@@ -489,20 +742,21 @@ int hvm_trace_loader(char **args) {
     const uint64_t size = values[0], layout = values[1], ini = values[2];
     const uint64_t loader = values[3], target = values[4], mmu_stop = values[5];
     const uint64_t handoff = values[6], kernel_offset = values[7], secondary_offset = values[8], main_offset = values[9];
-    const uint64_t barrier_offset = values[10];
+    const uint64_t smp_offset = values[10], write0_offset = values[11];
     const hv_ipa_t image_base = mmu_stop ? virt_kernel_base : reference_image_base;
     if (size < 32 || size > 64 * 1024 * 1024 ||
         layout < image_base || layout >= ini || ini >= loader ||
         loader >= target || target > image_base + size - 4 ||
-        ((loader | target | mmu_stop | handoff | kernel_offset | secondary_offset | main_offset | barrier_offset) & 3) ||
+        ((loader | target | mmu_stop | handoff | kernel_offset | secondary_offset | main_offset | smp_offset | write0_offset) & 3) ||
         (mmu_stop && (mmu_stop <= target || mmu_stop > image_base + size - 4)) ||
         (handoff && (!mmu_stop || handoff <= target || handoff > image_base + size - 4)) ||
         (kernel_offset && (!handoff || kernel_offset > ini - image_base - 4)) ||
         (secondary_offset && (!kernel_offset || secondary_offset > ini - image_base - 4)) ||
         (main_offset && (!secondary_offset || secondary_offset != kernel_offset ||
                          main_offset > ini - image_base - 8)) ||
-        (barrier_offset && (!main_offset || barrier_offset <= main_offset + 4 ||
-                            barrier_offset > ini - image_base - 4))) {
+        (smp_offset && (!main_offset || smp_offset <= main_offset + 4 ||
+                            smp_offset > ini - image_base - 4)) ||
+        (write0_offset && (!smp_offset || write0_offset > ini - image_base - 4))) {
         return EXIT_FAILURE;
     }
     const size_t page = (size_t)getpagesize();
@@ -513,7 +767,7 @@ int hvm_trace_loader(char **args) {
     hvm_vcpu_t cpu = {0};
     hvm_memory_t memory = {0}, ini_header = {0};
     smp_trace_t smp = {.image_base = image_base, .kernel_end = ini,
-                       .ram_end = image_base + rounded_size};
+                       .ram_end = image_base + rounded_size, .gic_lock = OS_UNFAIR_LOCK_INIT, .memory = &memory};
     if (!check("create VM", hvm_vm_create())) {
         return EXIT_FAILURE;
     }
@@ -532,8 +786,13 @@ int hvm_trace_loader(char **args) {
     }
     if (mmu_stop) {
         const uint8_t *bytes = memory.host_address;
-        if (memcmp(bytes + (ini - image_base), "INI1", 4) == 0) {
-            fprintf(stderr, "[HVM] The MMU trace expects an image without embedded initial processes\n");
+        const uint8_t *header = bytes + (ini - image_base);
+        static const uint8_t empty_ini[] = {
+            'I', 'N', 'I', '1', 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        };
+        if (memcmp(header, "INI1", 4) == 0 &&
+            (loader - ini < sizeof(empty_ini) || memcmp(header, empty_ini, sizeof(empty_ini)) != 0)) {
+            fprintf(stderr, "[HVM] Only an empty INI1 fits the trace's initial-process mapping\n");
             goto cleanup;
         }
     }
@@ -576,7 +835,7 @@ int hvm_trace_loader(char **args) {
         }
     }
     if (ok && handoff) {
-        ok = trace_handoff(&cpu, handoff, link, image_base, ini, kernel_offset, secondary_offset, main_offset, barrier_offset, &smp, &memory);
+        ok = trace_handoff(&cpu, handoff, link, image_base, ini, kernel_offset, secondary_offset, main_offset, smp_offset, write0_offset, &smp, &memory);
     }
 
 cleanup:

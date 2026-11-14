@@ -1,0 +1,8 @@
+diff --git a/libraries/libmesosphere/source/arch/arm64/kern_cpu.cpp b/libraries/libmesosphere/source/arch/arm64/kern_cpu.cpp
+index 36d7f9b..1114a99 100644
+--- a/libraries/libmesosphere/source/arch/arm64/kern_cpu.cpp
++++ b/libraries/libmesosphere/source/arch/arm64/kern_cpu.cpp
+@@ -517,0 +518 @@ namespace ams::kern::arch::arm64::cpu {
++        #if !defined(ATMOSPHERE_BOARD_QEMU_VIRT)
+@@ -518,0 +520 @@ namespace ams::kern::arch::arm64::cpu {
++        #endif
