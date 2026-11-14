@@ -57,13 +57,18 @@ def ipc_kips(prefix):
     ]
 
 
+def read_kip(path, program_id):
+    kip = path.read_bytes()
+    if len(kip) < 0x100 or kip[:4] != b"KIP1" or struct.unpack_from("<Q", kip, 0x10)[0] != program_id:
+        raise ValueError(f"expected an Atmosphère KIP with program ID {program_id:016x}")
+    stored_size = sum(struct.unpack_from("<I", kip, off)[0] for off in (0x28, 0x38, 0x48))
+    if len(kip) != 0x100 + stored_size:
+        raise ValueError("KIP segment sizes do not match the file")
+    return kip
+
+
 def sm_kips(path, prefix):
-    sm = path.read_bytes()
-    if len(sm) < 0x100 or sm[:4] != b"KIP1" or struct.unpack_from("<Q", sm, 0x10)[0] != 0x0100000000000004:
-        raise ValueError("expected Atmosphère's sm.kip with program ID 0100000000000004")
-    stored_size = sum(struct.unpack_from("<I", sm, off)[0] for off in (0x28, 0x38, 0x48))
-    if len(sm) != 0x100 + stored_size:
-        raise ValueError("SM KIP segment sizes do not match the file")
+    sm = read_kip(path, 0x0100000000000004)
     client = make_kip(assemble_probe("sm_probe", prefix), b"HvmSmProbe",
                       0x010000000000FF04, 32, (7, 0x0B, 0x1F, 0x21))
     return [sm, client]
@@ -101,6 +106,8 @@ def main():
     parser.add_argument("image", type=Path)
     parser.add_argument("output", type=Path)
     variants = parser.add_mutually_exclusive_group()
+    variants.add_argument("--loader-kips", type=Path, nargs=2, metavar=("SM", "LOADER"),
+                          help="boot the genuine Atmosphère SM and title loader")
     variants.add_argument("--sm-kip", type=Path, help="boot Atmosphère sm.kip and a registry probe")
     variants.add_argument("--ipc", action="store_true", help="build the two-process IPC probe")
     parser.add_argument("--tool-prefix", default="aarch64-none-elf-",
@@ -111,7 +118,10 @@ def main():
             args.output.exists() and args.image.samefile(args.output)
         ):
             raise ValueError("choose a separate output file")
-        if args.sm_kip is not None:
+        if args.loader_kips is not None:
+            sm, loader = args.loader_kips
+            kips = [read_kip(sm, 0x0100000000000004), read_kip(loader, 0x0100000000000001)]
+        elif args.sm_kip is not None:
             kips = sm_kips(args.sm_kip, args.tool_prefix)
         else:
             kips = ipc_kips(args.tool_prefix) if args.ipc else el0_kips()

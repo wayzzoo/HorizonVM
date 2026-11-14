@@ -156,6 +156,7 @@ typedef struct {
     uint64_t svc_offset;
     bool ipc_probe;
     bool sm_probe;
+    bool loader_probe;
     uint64_t ipc_server_ttbr;
     uint64_t ipc_client_ttbr;
     bool ipc_reply_seen;
@@ -626,6 +627,27 @@ static bool verify_sm_reply(smp_trace_t *smp, hvm_vcpu_t *cpu) {
     return true;
 }
 
+static bool observe_loader_fs_request(smp_trace_t *smp, hvm_vcpu_t *cpu, unsigned core) {
+    uint64_t tls;
+    if (!check("read loader TLS", hv_vcpu_get_sys_reg(cpu->handle, HV_SYS_REG_TPIDRRO_EL0, &tls)) ||
+        !tls || (tls & 15) || tls >= (UINT64_C(1) << 39)) {
+        return false;
+    }
+    const uint32_t *words = translate_guest_va(cpu, smp->memory, smp->ini_memory, tls, 40);
+    if (!words) {
+        return false;
+    }
+    /* CMIF GetServiceHandle for fsp-srv. The loader must issue this
+       before registering its own ldr:* services. */
+    if (words[0] == 4 && words[1] == 10 && words[4] == UINT32_C(0x49434653) &&
+        words[6] == 1 && memcmp(words + 8, "fsp-srv", 8) == 0) {
+        printf("[HVM] Atmosphère Loader requested fsp-srv from EL0 on core %u\n", core);
+        atomic_store(&smp->stop_observed, true);
+        return stop_smp_peers(smp, core);
+    }
+    return true;
+}
+
 static bool handle_el0_svc(smp_trace_t *smp, hvm_vcpu_t *cpu, unsigned core, uint64_t esr) {
     if (!smp->svc_checkpoint || esr != UINT64_C(0x5a000482)) {
         return false;
@@ -646,6 +668,12 @@ static bool handle_el0_svc(smp_trace_t *smp, hvm_vcpu_t *cpu, unsigned core, uin
         return false;
     }
     const unsigned syscall = guest_esr & 0xffff;
+    if (smp->loader_probe) {
+        if (syscall == 0x21 && !observe_loader_fs_request(smp, cpu, core)) {
+            return false;
+        }
+        return atomic_load(&smp->stop_observed) || resume_ipc_syscall(cpu);
+    }
     const uint64_t expected_marker = smp->sm_probe ? 0x534d : smp->ipc_probe ? 0x4950 : 0x4856;
     if ((smp->ipc_probe || smp->sm_probe) && (syscall != 7 || marker != expected_marker)) {
         if (syscall == 7 && (marker == 0x4951 || marker == 0x4952 || marker == 0x534e)) {
@@ -1075,6 +1103,7 @@ int hvm_trace_loader(char **args) {
     const uint64_t svc_offset = values[13];
     const bool ipc_probe = values[14] == 1;
     const bool sm_probe = values[14] == 2;
+    const bool loader_probe = values[14] == 3;
     const hv_ipa_t image_base = mmu_stop ? virt_kernel_base : reference_image_base;
     if (size < 32 || size > 64 * 1024 * 1024 ||
         layout < image_base || layout >= ini || ini >= loader ||
@@ -1091,7 +1120,7 @@ int hvm_trace_loader(char **args) {
         (write0_offset && ((!smp_offset && !timer_smoke && !svc_offset) || write0_offset > ini - image_base - 4)) ||
         values[12] > 1 || (timer_smoke && (!main_offset || smp_offset || svc_offset)) ||
         (svc_offset && (!main_offset || smp_offset || svc_offset > ini - image_base - 4)) ||
-        values[14] > 2 || ((ipc_probe || sm_probe) && !svc_offset)) {
+        values[14] > 3 || ((ipc_probe || sm_probe || loader_probe) && !svc_offset)) {
         return EXIT_FAILURE;
     }
     const size_t page = (size_t)getpagesize();
@@ -1104,7 +1133,7 @@ int hvm_trace_loader(char **args) {
     smp_trace_t smp = {.image_base = image_base, .kernel_end = ini,
                        .ram_end = image_base + rounded_size, .gic_lock = OS_UNFAIR_LOCK_INIT,
                        .memory = &memory, .ini_memory = &ini_header,
-                       .timer_smoke = timer_smoke, .svc_offset = svc_offset, .ipc_probe = ipc_probe, .sm_probe = sm_probe};
+                       .timer_smoke = timer_smoke, .svc_offset = svc_offset, .ipc_probe = ipc_probe, .sm_probe = sm_probe, .loader_probe = loader_probe};
     atomic_init(&smp.stop_observed, false);
     if (!check("create VM", hvm_vm_create())) {
         return EXIT_FAILURE;
@@ -1136,8 +1165,8 @@ int hvm_trace_loader(char **args) {
             }
             memcpy(&ini_size, header + 4, 4);
             memcpy(&processes, header + 8, 4);
-            const uint32_t expected_processes = ipc_probe || sm_probe ? 2 : 1;
-            if (processes != expected_processes || ini_size <= sizeof(empty_ini) || ini_size > (sm_probe ? virt_ini_reserve : page) || ini_size > loader - ini) {
+            const uint32_t expected_processes = ipc_probe || sm_probe || loader_probe ? 2 : 1;
+            if (processes != expected_processes || ini_size <= sizeof(empty_ini) || ini_size > ((sm_probe || loader_probe) ? virt_ini_reserve : page) || ini_size > loader - ini) {
                 fprintf(stderr, "[HVM] EL0 trace requires its expected KIP count and a backed INI1 range\n");
                 goto cleanup;
             }
