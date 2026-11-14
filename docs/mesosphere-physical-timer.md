@@ -34,4 +34,4 @@ python3 tools/trace_mesosphere.py "$empty_image" --native ./horizonvm \
 ```
 
 A successful run reports `completed PPI 30, IAR acknowledgements=1 EOI=1`.
-The next milestone requires an open-source KIP to verify EL0 execution.
+The follow-up [EL0 trace](mesosphere-first-user-process.md) runs a standalone open-source KIP.

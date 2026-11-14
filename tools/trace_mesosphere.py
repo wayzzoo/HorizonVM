@@ -93,7 +93,7 @@ class GdbRemote:
             raise RuntimeError(f"unexpected QEMU stop: {response}")
 
 
-def trace(image_path, timeout, native, mmu_offset, handoff_offset, kernel_offset, secondary_offset, main_offset, smp_offset, verify_barrier, write0_offset, timer_smoke):
+def trace(image_path, timeout, native, mmu_offset, handoff_offset, kernel_offset, secondary_offset, main_offset, smp_offset, verify_barrier, write0_offset, timer_smoke, svc_offset):
     with image_path.open("rb") as file:
         image = file.read(MAX_IMAGE_SIZE + 1)
     if len(image) > MAX_IMAGE_SIZE:
@@ -117,7 +117,7 @@ def trace(image_path, timeout, native, mmu_offset, handoff_offset, kernel_offset
             raise ValueError("handoff checkpoint is outside the loader")
         if struct.unpack_from("<I", image, offset)[0] != 0xd61f0060:
             raise ValueError("handoff checkpoint must point to BR X3")
-    for checkpoint in (kernel_offset, secondary_offset, main_offset, smp_offset, write0_offset):
+    for checkpoint in (kernel_offset, secondary_offset, main_offset, smp_offset, write0_offset, svc_offset):
         if checkpoint and (checkpoint < 0 or checkpoint & 3 or checkpoint > ini - base - 4):
             raise ValueError("checkpoint is outside the kernel")
     if main_offset and (
@@ -138,7 +138,7 @@ def trace(image_path, timeout, native, mmu_offset, handoff_offset, kernel_offset
     print(f"Image SHA-256: {hashlib.sha256(image).hexdigest()}", flush=True)
     if native is not None:
         command = [str(native.resolve()), "--trace-loader",
-                   *(hex(value) for value in (len(image), layout, ini, loader, target, mmu_stop, handoff, kernel_offset, secondary_offset, main_offset, smp_offset, write0_offset, timer_smoke))]
+                   *(hex(value) for value in (len(image), layout, ini, loader, target, mmu_stop, handoff, kernel_offset, secondary_offset, main_offset, smp_offset, write0_offset, timer_smoke, svc_offset))]
         subprocess.run(command, input=image, timeout=timeout, check=True)
         return
 
@@ -208,11 +208,13 @@ def main():
                         metavar="KERNEL_OFFSET", help="forward SYS_WRITE0 debug strings to stdout")
     smp_checkpoint.add_argument("--timer-smoke", action="store_true",
                                 help="run all cores until the first physical timer EOI")
+    smp_checkpoint.add_argument("--el0-svc-checkpoint", type=lambda value: int(value, 0), default=0,
+                                metavar="KERNEL_OFFSET", help="verify the EL0 probe at the AArch64 SVC handler")
     args = parser.parse_args()
     smp_offset = args.through_barrier or args.smp_checkpoint
-    if args.semihost_write0 and not (smp_offset or args.timer_smoke):
+    if args.semihost_write0 and not (smp_offset or args.timer_smoke or args.el0_svc_checkpoint):
         parser.error("--semihost-write0 requires an SMP run")
-    if (smp_offset or args.timer_smoke) and not args.all_cores_entry:
+    if (smp_offset or args.timer_smoke or args.el0_svc_checkpoint) and not args.all_cores_entry:
         parser.error("an SMP checkpoint requires --all-cores-entry")
     if args.all_cores_entry and (
         not args.secondary_checkpoint or args.secondary_checkpoint != args.kernel_checkpoint
@@ -231,7 +233,7 @@ def main():
     try:
         trace(args.image, args.timeout, args.native, args.through_mmu, args.handoff,
               args.kernel_checkpoint, args.secondary_checkpoint, args.all_cores_entry, smp_offset, bool(args.through_barrier),
-              args.semihost_write0, args.timer_smoke)
+              args.semihost_write0, args.timer_smoke, args.el0_svc_checkpoint)
     except (OSError, ValueError, RuntimeError, struct.error, subprocess.SubprocessError) as error:
         sys.exit(f"Trace failed: {error}")
 

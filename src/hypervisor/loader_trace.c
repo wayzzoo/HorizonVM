@@ -23,6 +23,7 @@ static const uint64_t el1h_masked = 0x3c5;
 /* QEMU virt's 4 GiB DRAM starts at 0x40000000. Mesosphère places the
    initial-process header 12 MiB below its end. */
 static const hv_ipa_t virt_ini_destination = 0x13f400000;
+static const size_t virt_ini_reserve = 12 * 1024 * 1024;
 static const size_t loader_working_ram = 40 * 1024 * 1024;
 
 static bool check(const char *operation, hv_return_t result) {
@@ -151,10 +152,18 @@ typedef struct {
     uint64_t smp_checkpoint;
     uint64_t write0_pc;
     bool timer_smoke;
-    atomic_bool timer_observed;
+    uint64_t svc_checkpoint;
+    uint64_t svc_offset;
+    atomic_bool stop_observed;
     const hvm_memory_t *memory;
+    const hvm_memory_t *ini_memory;
     os_unfair_lock gic_lock;
     dispatch_semaphore_t interrupt_ready[HVM_GICV2_CPUS];
+    struct {
+        hv_vcpu_t handle;
+        bool running;
+        bool irq_kick;
+    } irq_targets[HVM_GICV2_CPUS];
     hvm_gicv2_t gic;
     unsigned sgi_acks[HVM_GICV2_CPUS];
     unsigned timer_acks[HVM_GICV2_CPUS];
@@ -254,6 +263,32 @@ static bool run_to_main(hvm_vcpu_t *cpu, uint64_t address, uint64_t affinity) {
            exit->exception.syndrome == UINT64_C(0x5a000480);
 }
 
+/* The GIC lock protects the active handles from being destroyed or
+   re-entered while a peer requests an asynchronous VM exit. */
+static bool kick_running_core_locked(smp_trace_t *smp, unsigned core) {
+    if (smp->irq_targets[core].running && !smp->irq_targets[core].irq_kick) {
+        hv_vcpu_t target = smp->irq_targets[core].handle;
+        if (!check("wake running vCPU", hv_vcpus_exit(&target, 1))) {
+            return false;
+        }
+        smp->irq_targets[core].irq_kick = true;
+    }
+    return true;
+}
+
+static bool stop_smp_peers(smp_trace_t *smp, unsigned core) {
+    bool ok = true;
+    os_unfair_lock_lock(&smp->gic_lock);
+    for (unsigned other = 0; other < HVM_GICV2_CPUS; ++other) {
+        if (other != core) {
+            dispatch_semaphore_signal(smp->interrupt_ready[other]);
+            ok = kick_running_core_locked(smp, other) && ok;
+        }
+    }
+    os_unfair_lock_unlock(&smp->gic_lock);
+    return ok;
+}
+
 static bool service_gic(smp_trace_t *smp, hvm_vcpu_t *cpu, unsigned core,
                         const hv_vcpu_exit_exception_t *fault) {
     const uint64_t esr = fault->syndrome;
@@ -277,10 +312,14 @@ static bool service_gic(smp_trace_t *smp, hvm_vcpu_t *cpu, unsigned core,
     uint32_t value = (uint32_t)reg;
     os_unfair_lock_lock(&smp->gic_lock);
     const bool handled = hvm_gicv2_access(&smp->gic, core, ipa, width, write, &value);
+    bool wake_ok = true;
     if (handled && write && ipa == HVM_VIRT_GICD_BASE + 0xf00) {
         for (unsigned target = 0; target < HVM_GICV2_CPUS; ++target) {
             if (hvm_gicv2_irq_pending(&smp->gic, target)) {
                 dispatch_semaphore_signal(smp->interrupt_ready[target]);
+                if (target != core) {
+                    wake_ok = kick_running_core_locked(smp, target) && wake_ok;
+                }
             }
         }
     }
@@ -292,7 +331,7 @@ static bool service_gic(smp_trace_t *smp, hvm_vcpu_t *cpu, unsigned core,
             ++smp->timer_acks[core];
         }
     }
-    if (!handled ||
+    if (!handled || !wake_ok ||
         (!write && rt != 31 &&
          !check("return GIC read value", hv_vcpu_set_reg(cpu->handle, HV_REG_X0 + rt, value))) ||
         !check("read GIC access PC", hv_vcpu_get_reg(cpu->handle, HV_REG_PC, &pc)) ||
@@ -301,12 +340,10 @@ static bool service_gic(smp_trace_t *smp, hvm_vcpu_t *cpu, unsigned core,
     }
     if (write && ipa == HVM_VIRT_GICC_BASE + 0x10 && value == 30) {
         ++smp->timer_eois[core];
-        if (smp->timer_smoke && !atomic_exchange(&smp->timer_observed, true)) {
+        if (smp->timer_smoke && !atomic_exchange(&smp->stop_observed, true)) {
             printf("[HVM] Core %u completed PPI 30, IAR acknowledgements=%u EOI=%u\n",
                    core, smp->timer_acks[core], smp->timer_eois[core]);
-            for (unsigned other = 0; other < HVM_GICV2_CPUS; ++other) {
-                dispatch_semaphore_signal(smp->interrupt_ready[other]);
-            }
+            return stop_smp_peers(smp, core);
         }
     }
     return true;
@@ -354,8 +391,8 @@ static bool service_physical_timer(smp_trace_t *smp, hvm_vcpu_t *cpu,
            check("resume after physical timer access", hv_vcpu_set_reg(cpu->handle, HV_REG_PC, pc + 4));
 }
 
-static void *translate_kernel_va(hvm_vcpu_t *cpu, const hvm_memory_t *memory,
-                                 uint64_t va, size_t width);
+static void *translate_guest_va(hvm_vcpu_t *cpu, const hvm_memory_t *memory,
+                                const hvm_memory_t *ini_memory, uint64_t va, size_t width);
 
 static bool service_write0(smp_trace_t *smp, hvm_vcpu_t *cpu, uint64_t esr) {
     if (!smp->write0_pc || esr != UINT64_C(0x5a00f000)) {
@@ -379,7 +416,7 @@ static bool service_write0(smp_trace_t *smp, hvm_vcpu_t *cpu, uint64_t esr) {
         if (chunk > sizeof(line) - count) {
             chunk = sizeof(line) - count;
         }
-        const char *source = translate_kernel_va(cpu, smp->memory, cursor, chunk);
+        const char *source = translate_guest_va(cpu, smp->memory, smp->ini_memory, cursor, chunk);
         if (!source) {
             return false;
         }
@@ -420,14 +457,49 @@ static int64_t timer_delay_ns(const smp_trace_t *smp, unsigned core) {
     return ns < INT64_MAX ? (int64_t)ns : INT64_MAX;
 }
 
-static bool irq_pending(smp_trace_t *smp, unsigned core) {
-    os_unfair_lock_lock(&smp->gic_lock);
+static bool irq_pending_locked(smp_trace_t *smp, unsigned core) {
     const bool timer_asserted = smp->physical_timer[core].control == 1 &&
                                 physical_counter_ticks() >= smp->physical_timer[core].compare;
     hvm_gicv2_set_ppi(&smp->gic, core, 30, timer_asserted);
-    const bool pending = hvm_gicv2_irq_pending(&smp->gic, core);
+    return hvm_gicv2_irq_pending(&smp->gic, core);
+}
+
+static bool irq_pending(smp_trace_t *smp, unsigned core) {
+    os_unfair_lock_lock(&smp->gic_lock);
+    const bool pending = irq_pending_locked(smp, core);
     os_unfair_lock_unlock(&smp->gic_lock);
     return pending;
+}
+
+static bool enter_smp_guest(smp_trace_t *smp, hvm_vcpu_t *cpu, unsigned core,
+                            int64_t delay_ns, bool timer_deadline, bool *irq_exit) {
+    os_unfair_lock_lock(&smp->gic_lock);
+    if (atomic_load(&smp->stop_observed)) {
+        os_unfair_lock_unlock(&smp->gic_lock);
+        *irq_exit = true;
+        return true;
+    }
+    const bool pending = irq_pending_locked(smp, core);
+    const bool configured = check("set GIC IRQ line",
+                                  hv_vcpu_set_pending_interrupt(cpu->handle, HV_INTERRUPT_TYPE_IRQ, pending));
+    smp->irq_targets[core].handle = cpu->handle;
+    smp->irq_targets[core].running = configured;
+    os_unfair_lock_unlock(&smp->gic_lock);
+    if (!configured) {
+        return false;
+    }
+
+    bool timer_woke;
+    const bool ok = run_until(cpu, delay_ns, timer_deadline, &timer_woke);
+    os_unfair_lock_lock(&smp->gic_lock);
+    smp->irq_targets[core].running = false;
+    const bool canceled = ok && cpu->exit_info && cpu->exit_info->reason == HV_EXIT_REASON_CANCELED;
+    *irq_exit = canceled && (timer_woke || smp->irq_targets[core].irq_kick);
+    if (canceled) {
+        smp->irq_targets[core].irq_kick = false;
+    }
+    os_unfair_lock_unlock(&smp->gic_lock);
+    return ok;
 }
 
 static bool service_wfi(smp_trace_t *smp, hvm_vcpu_t *cpu, unsigned core, uint64_t esr) {
@@ -437,7 +509,7 @@ static bool service_wfi(smp_trace_t *smp, hvm_vcpu_t *cpu, unsigned core, uint64
     /* WFI wakes on an asserted IRQ even if guest PSTATE masks exceptions. */
     const dispatch_time_t deadline = dispatch_time(DISPATCH_TIME_NOW, guest_timeout_ns);
     while (!irq_pending(smp, core)) {
-        if (atomic_load(&smp->timer_observed)) {
+        if (atomic_load(&smp->stop_observed)) {
             return false;
         }
         int64_t until_timer = timer_delay_ns(smp, core);
@@ -460,6 +532,38 @@ static bool service_wfi(smp_trace_t *smp, hvm_vcpu_t *cpu, unsigned core, uint64
            check("advance after WFI", hv_vcpu_set_reg(cpu->handle, HV_REG_PC, pc + 4));
 }
 
+static bool observe_el0_svc(smp_trace_t *smp, hvm_vcpu_t *cpu, unsigned core, uint64_t esr) {
+    if (!smp->svc_checkpoint || esr != UINT64_C(0x5a000482)) {
+        return false;
+    }
+    uint64_t pc, elr, spsr, guest_esr, marker, sp;
+    if (!check("read SVC checkpoint PC", hv_vcpu_get_reg(cpu->handle, HV_REG_PC, &pc)) ||
+        !check("read SVC guest syndrome", hv_vcpu_get_sys_reg(cpu->handle, HV_SYS_REG_ESR_EL1, &guest_esr)) ||
+        !check("read SVC return PC", hv_vcpu_get_sys_reg(cpu->handle, HV_SYS_REG_ELR_EL1, &elr)) ||
+        !check("read SVC saved PSTATE", hv_vcpu_get_sys_reg(cpu->handle, HV_SYS_REG_SPSR_EL1, &spsr)) ||
+        !check("read user stack", hv_vcpu_get_sys_reg(cpu->handle, HV_SYS_REG_SP_EL0, &sp)) ||
+        !check("read EL0 marker", hv_vcpu_get_reg(cpu->handle, HV_REG_X0, &marker))) {
+        return false;
+    }
+    if (pc != smp->svc_checkpoint + 4 || guest_esr != UINT64_C(0x56000007) ||
+        (spsr & 0x1f) || elr >= (UINT64_C(1) << 39) || (elr & 0xfff) != 8 ||
+        marker != 0x4856 || !sp || (sp & 15) || sp >= (UINT64_C(1) << 39)) {
+        fprintf(stderr, "[HVM] Unexpected EL0 SVC state\n");
+        return false;
+    }
+    const uint32_t *code = translate_guest_va(cpu, smp->memory, smp->ini_memory, elr - 8,
+                                               2 * sizeof(uint32_t));
+    if (!code || code[0] != UINT32_C(0xd2890ac0) || code[1] != UINT32_C(0xd40000e1)) {
+        fprintf(stderr, "[HVM] User instructions do not match the EL0 probe\n");
+        return false;
+    }
+    printf("[HVM] Core %u observed EL0 SVC #7, guest PC=%#" PRIx64 " SP_EL0=%#" PRIx64
+           " SPSR_EL1=%#" PRIx64 " ESR_EL1=%#" PRIx64 " X0=%#" PRIx64 "\n",
+           core, elr - 4, sp, spsr, guest_esr, marker);
+    atomic_store(&smp->stop_observed, true);
+    return stop_smp_peers(smp, core);
+}
+
 static bool run_to_smp_checkpoint(hvm_vcpu_t *cpu, smp_trace_t *smp, uint64_t affinity) {
     uint64_t pc, state, regs[4];
     if (!check("resume at restored kernel instruction",
@@ -467,25 +571,28 @@ static bool run_to_smp_checkpoint(hvm_vcpu_t *cpu, smp_trace_t *smp, uint64_t af
         return false;
     }
     size_t gic_accesses = 0, timer_accesses = 0;
-    bool stopped_after_timer = false;
+    bool stopped_after_event = false;
     for (unsigned exits = 0; ; ++exits) {
-        if (atomic_load(&smp->timer_observed)) {
-            stopped_after_timer = true;
+        if (atomic_load(&smp->stop_observed)) {
+            stopped_after_event = true;
             break;
         }
         const int64_t until_timer = timer_delay_ns(smp, (unsigned)affinity);
         const bool timer_deadline = until_timer > 0 && until_timer < guest_timeout_ns;
-        bool timer_woke;
-        if (!check("set GIC IRQ line", hv_vcpu_set_pending_interrupt(cpu->handle, HV_INTERRUPT_TYPE_IRQ,
-                                                                    irq_pending(smp, (unsigned)affinity))) ||
-            !run_until(cpu, timer_deadline ? until_timer : guest_timeout_ns, timer_deadline, &timer_woke)) {
+        bool irq_exit;
+        if (!enter_smp_guest(smp, cpu, (unsigned)affinity, timer_deadline ? until_timer : guest_timeout_ns,
+                             timer_deadline, &irq_exit)) {
             return false;
         }
         const hv_vcpu_exit_t *current = cpu->exit_info;
-        if (current && current->reason == HV_EXIT_REASON_CANCELED && timer_woke && exits < 4096) {
+        if (irq_exit && exits < 4096) {
             continue;
         }
         if (!current || current->reason != HV_EXIT_REASON_EXCEPTION || exits == 4096) {
+            break;
+        }
+        if (observe_el0_svc(smp, cpu, (unsigned)affinity, current->exception.syndrome)) {
+            stopped_after_event = true;
             break;
         }
         if (service_gic(smp, cpu, (unsigned)affinity, &current->exception)) {
@@ -502,8 +609,8 @@ static bool run_to_smp_checkpoint(hvm_vcpu_t *cpu, smp_trace_t *smp, uint64_t af
         if (service_wfi(smp, cpu, (unsigned)affinity, current->exception.syndrome)) {
             continue;
         }
-        stopped_after_timer = current->exception.syndrome == UINT64_C(0x07e00000) &&
-                              atomic_load(&smp->timer_observed);
+        stopped_after_event = current->exception.syndrome == UINT64_C(0x07e00000) &&
+                              atomic_load(&smp->stop_observed);
         break;
     }
     const hv_vcpu_exit_t *exit = cpu->exit_info;
@@ -512,7 +619,7 @@ static bool run_to_smp_checkpoint(hvm_vcpu_t *cpu, smp_trace_t *smp, uint64_t af
     printf("[HVM] Core %" PRIu64 " checkpoint trace, GIC accesses=%zu, timer accesses=%zu, SGI acknowledgements=%u, PPI 30 acknowledgements=%u EOI=%u\n",
            affinity, gic_accesses, timer_accesses, smp->sgi_acks[affinity],
            smp->timer_acks[affinity], smp->timer_eois[affinity]);
-    if (stopped_after_timer) {
+    if (stopped_after_event) {
         funlockfile(stdout);
         return true;
     }
@@ -579,7 +686,7 @@ static bool service_cpu_on(smp_trace_t *smp, hvm_vcpu_t *primary) {
                 slot->reached_main = run_to_main(&secondary, smp->main_checkpoint, affinity);
                 dispatch_semaphore_signal(slot->complete);
                 dispatch_semaphore_wait(slot->release, DISPATCH_TIME_FOREVER);
-                if (smp->smp_checkpoint || smp->timer_smoke) {
+                if (smp->smp_checkpoint || smp->timer_smoke || smp->svc_checkpoint) {
                     slot->reached_smp_checkpoint = run_to_smp_checkpoint(&secondary, smp, affinity);
                     dispatch_semaphore_signal(slot->complete);
                     dispatch_semaphore_wait(slot->release, DISPATCH_TIME_FOREVER);
@@ -617,42 +724,57 @@ static bool destroy_secondaries(smp_trace_t *smp) {
 }
 
 static void *ram_pointer(const hvm_memory_t *memory, uint64_t ipa, size_t width) {
-    if (ipa < memory->guest_address || width > memory->size ||
+    if (!memory || !memory->mapped || ipa < memory->guest_address || width > memory->size ||
         ipa - memory->guest_address > memory->size - width) {
         return NULL;
     }
     return (uint8_t *)memory->host_address + (ipa - memory->guest_address);
 }
 
-/* Walk the loader's 39-bit TTBR1 translation to locate the instruction in
-   stage-2 RAM after the guest has randomized its kernel pages. */
-static void *translate_kernel_va(hvm_vcpu_t *cpu, const hvm_memory_t *memory,
-                                 uint64_t va, size_t width) {
+static void *guest_backing(const hvm_memory_t *memory, const hvm_memory_t *ini_memory,
+                           uint64_t ipa, size_t width) {
+    void *pointer = ram_pointer(memory, ipa, width);
+    return pointer ? pointer : ram_pointer(ini_memory, ipa, width);
+}
+
+/* Walk the 39-bit, 4 KiB regime used by the relocated kernel and probe. */
+static void *translate_guest_va(hvm_vcpu_t *cpu, const hvm_memory_t *memory,
+                                const hvm_memory_t *ini_memory, uint64_t va, size_t width) {
     const uint64_t address_mask = UINT64_C(0xfffffffff000);
+    const bool high = va >= UINT64_C(0xffffff8000000000);
+    if (!high && va >= (UINT64_C(1) << 39)) {
+        return NULL;
+    }
     uint64_t tcr, table;
-    if (!check("read TTBR1 granule", hv_vcpu_get_sys_reg(cpu->handle, HV_SYS_REG_TCR_EL1, &tcr)) ||
-        !check("read TTBR1 table", hv_vcpu_get_sys_reg(cpu->handle, HV_SYS_REG_TTBR1_EL1, &table)) ||
-        ((tcr >> 16) & 0x3f) != 25 || ((tcr >> 30) & 3) != 2) {
+    if (!check("read translation control", hv_vcpu_get_sys_reg(cpu->handle, HV_SYS_REG_TCR_EL1, &tcr)) ||
+        !check("read translation table", hv_vcpu_get_sys_reg(cpu->handle,
+               high ? HV_SYS_REG_TTBR1_EL1 : HV_SYS_REG_TTBR0_EL1, &table))) {
+        return NULL;
+    }
+    const bool compatible = high ? ((tcr >> 16) & 0x3f) == 25 && ((tcr >> 30) & 3) == 2
+                                 : (tcr & 0x3f) == 25 && ((tcr >> 14) & 3) == 0;
+    if (!compatible) {
         return NULL;
     }
     for (int shift = 30; shift >= 12; shift -= 9) {
         const uint64_t index = (va >> shift) & 0x1ff;
-        const uint64_t *entry = ram_pointer(memory, (table & address_mask) + index * 8, 8);
-        if (!entry || !(*entry & 1)) {
+        const uint64_t *entry = guest_backing(memory, ini_memory, (table & address_mask) + index * 8, 8);
+        if (!entry || !(*entry & 1) || (shift == 12 && !(*entry & 2))) {
             return NULL;
         }
         table = *entry;
         if (shift == 12 || !(table & 2)) {
             const uint64_t offset_mask = (UINT64_C(1) << shift) - 1;
-            const uint64_t ipa = (table & address_mask & ~offset_mask) | (va & offset_mask);
-            return ram_pointer(memory, ipa, width);
+            const uint64_t offset = va & offset_mask;
+            const uint64_t ipa = (table & address_mask & ~offset_mask) | offset;
+            return width <= offset_mask + 1 - offset ? guest_backing(memory, ini_memory, ipa, width) : NULL;
         }
     }
     return NULL;
 }
 
 static uint32_t *main_instruction(hvm_vcpu_t *cpu, const hvm_memory_t *memory, uint64_t va) {
-    return translate_kernel_va(cpu, memory, va, sizeof(uint32_t));
+    return translate_guest_va(cpu, memory, NULL, va, sizeof(uint32_t));
 }
 
 static void print_kernel_fault_instruction(hvm_vcpu_t *cpu, const hvm_memory_t *memory) {
@@ -701,12 +823,13 @@ static bool trace_main_all(hvm_vcpu_t *cpu, smp_trace_t *smp,
     }
     *instruction = original;
     sys_icache_invalidate(instruction, sizeof(*instruction));
-    if (!ok || (!checkpoint && !smp->timer_smoke)) {
+    if (!ok || (!checkpoint && !smp->timer_smoke && !smp->svc_checkpoint)) {
         return ok;
     }
 
-    uint32_t *checkpoint_instruction = checkpoint ? main_instruction(cpu, memory, checkpoint) : NULL;
-    if (checkpoint && !checkpoint_instruction) {
+    const uint64_t marker = smp->svc_checkpoint ? smp->svc_checkpoint : checkpoint;
+    uint32_t *checkpoint_instruction = marker ? main_instruction(cpu, memory, marker) : NULL;
+    if (marker && !checkpoint_instruction) {
         fprintf(stderr, "[HVM] Could not translate the SMP checkpoint\n");
         return false;
     }
@@ -724,7 +847,15 @@ static bool trace_main_all(hvm_vcpu_t *cpu, smp_trace_t *smp,
     uint32_t saved = 0;
     if (checkpoint_instruction) {
         saved = *checkpoint_instruction;
-        *checkpoint_instruction = UINT32_C(0xd4009022);  /* HVC #0x481 */
+        if (smp->svc_checkpoint && saved != UINT32_C(0xd10483ff)) {
+            if (console) {
+                *console = UINT32_C(0xd45e0000);
+                sys_icache_invalidate(console, sizeof(*console));
+            }
+            fprintf(stderr, "[HVM] Unexpected AArch64 SVC handler prologue\n");
+            return false;
+        }
+        *checkpoint_instruction = smp->svc_checkpoint ? UINT32_C(0xd4009042) : UINT32_C(0xd4009022);
         sys_icache_invalidate(checkpoint_instruction, sizeof(*checkpoint_instruction));
     }
     smp->smp_checkpoint = checkpoint;
@@ -754,7 +885,7 @@ static bool trace_main_all(hvm_vcpu_t *cpu, smp_trace_t *smp,
         *console = UINT32_C(0xd45e0000);
         sys_icache_invalidate(console, sizeof(*console));
     }
-    return ok && (!smp->timer_smoke || atomic_load(&smp->timer_observed));
+    return ok && ((!smp->timer_smoke && !smp->svc_checkpoint) || atomic_load(&smp->stop_observed));
 }
 
 static bool trace_handoff(hvm_vcpu_t *cpu, uint64_t handoff, uint64_t link,
@@ -801,6 +932,9 @@ static bool trace_handoff(hvm_vcpu_t *cpu, uint64_t handoff, uint64_t link,
                                secondary_offset ? smp : NULL)) {
             return false;
         }
+        if (smp->svc_offset) {
+            smp->svc_checkpoint = virtual_base + smp->svc_offset;
+        }
         return !main_offset || trace_main_all(cpu, smp, memory, virtual_base + main_offset,
                                               smp_offset ? virtual_base + smp_offset : 0,
                                               write0_offset ? virtual_base + write0_offset : 0);
@@ -811,7 +945,7 @@ static bool trace_handoff(hvm_vcpu_t *cpu, uint64_t handoff, uint64_t link,
 int hvm_trace_loader(char **args) {
     /* Image metadata and SHA-256 are checked by the trace script. The child
        receives exactly the bytes hashed by that script via stdin. */
-    uint64_t values[13];
+    uint64_t values[14];
     for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
         char *end;
         errno = 0;
@@ -825,11 +959,12 @@ int hvm_trace_loader(char **args) {
     const uint64_t handoff = values[6], kernel_offset = values[7], secondary_offset = values[8], main_offset = values[9];
     const uint64_t smp_offset = values[10], write0_offset = values[11];
     const bool timer_smoke = values[12] == 1;
+    const uint64_t svc_offset = values[13];
     const hv_ipa_t image_base = mmu_stop ? virt_kernel_base : reference_image_base;
     if (size < 32 || size > 64 * 1024 * 1024 ||
         layout < image_base || layout >= ini || ini >= loader ||
         loader >= target || target > image_base + size - 4 ||
-        ((loader | target | mmu_stop | handoff | kernel_offset | secondary_offset | main_offset | smp_offset | write0_offset) & 3) ||
+        ((loader | target | mmu_stop | handoff | kernel_offset | secondary_offset | main_offset | smp_offset | write0_offset | svc_offset) & 3) ||
         (mmu_stop && (mmu_stop <= target || mmu_stop > image_base + size - 4)) ||
         (handoff && (!mmu_stop || handoff <= target || handoff > image_base + size - 4)) ||
         (kernel_offset && (!handoff || kernel_offset > ini - image_base - 4)) ||
@@ -838,8 +973,9 @@ int hvm_trace_loader(char **args) {
                          main_offset > ini - image_base - 8)) ||
         (smp_offset && (!main_offset || smp_offset <= main_offset + 4 ||
                             smp_offset > ini - image_base - 4)) ||
-        (write0_offset && ((!smp_offset && !timer_smoke) || write0_offset > ini - image_base - 4)) ||
-        values[12] > 1 || (timer_smoke && (!main_offset || smp_offset))) {
+        (write0_offset && ((!smp_offset && !timer_smoke && !svc_offset) || write0_offset > ini - image_base - 4)) ||
+        values[12] > 1 || (timer_smoke && (!main_offset || smp_offset || svc_offset)) ||
+        (svc_offset && (!main_offset || smp_offset || svc_offset > ini - image_base - 4))) {
         return EXIT_FAILURE;
     }
     const size_t page = (size_t)getpagesize();
@@ -850,8 +986,10 @@ int hvm_trace_loader(char **args) {
     hvm_vcpu_t cpu = {0};
     hvm_memory_t memory = {0}, ini_header = {0};
     smp_trace_t smp = {.image_base = image_base, .kernel_end = ini,
-                       .ram_end = image_base + rounded_size, .gic_lock = OS_UNFAIR_LOCK_INIT, .memory = &memory, .timer_smoke = timer_smoke};
-    atomic_init(&smp.timer_observed, false);
+                       .ram_end = image_base + rounded_size, .gic_lock = OS_UNFAIR_LOCK_INIT,
+                       .memory = &memory, .ini_memory = &ini_header,
+                       .timer_smoke = timer_smoke, .svc_offset = svc_offset};
+    atomic_init(&smp.stop_observed, false);
     if (!check("create VM", hvm_vm_create())) {
         return EXIT_FAILURE;
     }
@@ -861,7 +999,7 @@ int hvm_trace_loader(char **args) {
         goto cleanup;
     }
     if (mmu_stop && !check("map INI1 destination header",
-                          hvm_memory_create(&ini_header, virt_ini_destination, page))) {
+                          hvm_memory_create(&ini_header, virt_ini_destination, svc_offset ? virt_ini_reserve : page))) {
         goto cleanup;
     }
     if (fread(memory.host_address, 1, size, stdin) != size) {
@@ -874,9 +1012,21 @@ int hvm_trace_loader(char **args) {
         static const uint8_t empty_ini[] = {
             'I', 'N', 'I', '1', 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         };
-        if (memcmp(header, "INI1", 4) == 0 &&
-            (loader - ini < sizeof(empty_ini) || memcmp(header, empty_ini, sizeof(empty_ini)) != 0)) {
-            fprintf(stderr, "[HVM] Only an empty INI1 fits the trace's initial-process mapping\n");
+        if (svc_offset) {
+            uint32_t ini_size, processes;
+            if (memcmp(header, "INI1", 4) != 0 || loader - ini < sizeof(empty_ini)) {
+                fprintf(stderr, "[HVM] EL0 trace requires a valid INI1 header\n");
+                goto cleanup;
+            }
+            memcpy(&ini_size, header + 4, 4);
+            memcpy(&processes, header + 8, 4);
+            if (processes != 1 || ini_size <= sizeof(empty_ini) || ini_size > page || ini_size > loader - ini) {
+                fprintf(stderr, "[HVM] EL0 trace requires a single KIP in one INI1 page\n");
+                goto cleanup;
+            }
+        } else if (memcmp(header, "INI1", 4) == 0 &&
+                   (loader - ini < sizeof(empty_ini) || memcmp(header, empty_ini, sizeof(empty_ini)) != 0)) {
+            fprintf(stderr, "[HVM] Expected an empty INI1 for this trace\n");
             goto cleanup;
         }
     }
