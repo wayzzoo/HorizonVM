@@ -1,0 +1,20 @@
+diff --git a/libraries/config/common.mk b/libraries/config/common.mk
+index 7ef3708..fc92f7c 100644
+--- a/libraries/config/common.mk
++++ b/libraries/config/common.mk
+@@ -47 +47 @@ endif
+-export ATMOSPHERE_CXXFLAGS := -fno-rtti -fno-exceptions -std=gnu++23 -Wno-invalid-offsetof
++export ATMOSPHERE_CXXFLAGS := -fno-rtti -fno-exceptions -std=gnu++23 -Wno-invalid-offsetof -Wno-error=array-bounds
+diff --git a/libraries/libmesosphere/include/mesosphere/board/qemu/virt/kern_k_memory_layout.hpp b/libraries/libmesosphere/include/mesosphere/board/qemu/virt/kern_k_memory_layout.hpp
+index b18ec45..9c2ccbd 100644
+--- a/libraries/libmesosphere/include/mesosphere/board/qemu/virt/kern_k_memory_layout.hpp
++++ b/libraries/libmesosphere/include/mesosphere/board/qemu/virt/kern_k_memory_layout.hpp
+@@ -26,0 +27,2 @@ namespace ams::kern {
++    constexpr inline u32 MinimumMemoryManagerAlignmentShifts[] = {0, 0, 0, 0};
++
+diff --git a/mesosphere/kernel/source/arch/arm64/init/start.s b/mesosphere/kernel/source/arch/arm64/init/start.s
+index ad483ff..b437aea 100644
+--- a/mesosphere/kernel/source/arch/arm64/init/start.s
++++ b/mesosphere/kernel/source/arch/arm64/init/start.s
+@@ -16,0 +17 @@
++#include <mesosphere/kern_select_assembly_macros.h>

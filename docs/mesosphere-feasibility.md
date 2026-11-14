@@ -1,5 +1,7 @@
 # Mesosphère on HorizonVM
 
+This audit predates the [first verified loader instruction](mesosphere-first-execution.md).
+
 Early Mesosphère execution at EL1 is plausible on this M1. Boot through
 scheduler initialization is a separate milestone: the current QEMU board needs
 GICv2, four cores and a real secondary CPU startup service. No Mesosphère

@@ -11,6 +11,7 @@ LDFLAGS = -framework Hypervisor
 C_SOURCES = \
     src/main.c \
     src/hypervisor/probe.c \
+    src/hypervisor/loader_trace.c \
     src/hypervisor/vm.c \
     src/hypervisor/vcpu.c \
     src/hypervisor/memory.c \
