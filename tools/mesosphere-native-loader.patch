@@ -1,0 +1,23 @@
+diff --git a/libraries/libmesosphere/source/kern_k_system_control_base.cpp b/libraries/libmesosphere/source/kern_k_system_control_base.cpp
+index c92bbe6..2a2ea3a 100644
+--- a/libraries/libmesosphere/source/kern_k_system_control_base.cpp
++++ b/libraries/libmesosphere/source/kern_k_system_control_base.cpp
+@@ -147,0 +148,10 @@ namespace ams::kern {
++        #if defined(ATMOSPHERE_BOARD_QEMU_VIRT) && defined(ATMOSPHERE_ARCH_ARM64)
++        /* The primary loader runs alone before enabling translation. Its
++           RAM can have Device attributes then, so avoid exclusive accesses. */
++        if ((cpu::GetSctlrEl1() & 1) == 0) {
++            u64 value;
++            KSystemControl::GenerateRandomBytesForUninitialized(std::addressof(value), sizeof(value));
++            const u64 difference = max - min;
++            return difference == std::numeric_limits<u64>::max() ? value : min + value % (difference + 1);
++        }
++        #endif
+diff --git a/mesosphere/kernel_ldr/kernel_ldr.ld b/mesosphere/kernel_ldr/kernel_ldr.ld
+index 26802a6..1cfa4b6 100644
+--- a/mesosphere/kernel_ldr/kernel_ldr.ld
++++ b/mesosphere/kernel_ldr/kernel_ldr.ld
+@@ -147 +146,0 @@ SECTIONS
+-	__bss_start__ = .;
+@@ -149,0 +149 @@ SECTIONS
++		__bss_start__ = .;

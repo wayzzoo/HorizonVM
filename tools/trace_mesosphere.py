@@ -13,10 +13,11 @@ import tempfile
 import time
 
 IMAGE_BASE = 0x40200000  # Leave room for QEMU's DTB at 0x40000000.
+VIRT_KERNEL_BASE = 0x40080000  # Immediately after Mesosphère’s reserved early DRAM.
 MAX_IMAGE_SIZE = 64 << 20
 
 
-def image_layout(image):
+def image_layout(image, base):
     if len(image) < 12 or image[4:8] != b"MSS1":
         raise ValueError("expected a packaged Mesosphère image with MSS1 metadata")
     metadata, = struct.unpack_from("<I", image, 8)
@@ -38,7 +39,7 @@ def image_layout(image):
     target = loader_offset + displacement
     if not loader_offset + 16 <= target <= len(image) - 4:
         raise ValueError("loader entry branch target is outside executable image")
-    return IMAGE_BASE + metadata + 0x14, IMAGE_BASE + ini_offset, IMAGE_BASE + loader_offset, IMAGE_BASE + target
+    return base + metadata + 0x14, base + ini_offset, base + loader_offset, base + target
 
 
 class GdbRemote:
@@ -92,16 +93,36 @@ class GdbRemote:
             raise RuntimeError(f"unexpected QEMU stop: {response}")
 
 
-def trace(image_path, timeout, native):
+def trace(image_path, timeout, native, mmu_offset, handoff_offset, kernel_offset):
     with image_path.open("rb") as file:
         image = file.read(MAX_IMAGE_SIZE + 1)
     if len(image) > MAX_IMAGE_SIZE:
         raise ValueError("image does not fit in reference VM RAM")
-    layout, ini, loader, target = image_layout(image)
+    base = VIRT_KERNEL_BASE if mmu_offset is not None else IMAGE_BASE
+    layout, ini, loader, target = image_layout(image, base)
+    mmu_stop = 0
+    if mmu_offset is not None:
+        mmu_stop = loader + mmu_offset
+        offset = mmu_stop - base
+        if mmu_stop <= target or offset & 3 or offset > len(image) - 4:
+            raise ValueError("MMU checkpoint is outside the loader")
+        sctlr_write, barrier = struct.unpack_from("<II", image, offset - 8)
+        if (sctlr_write & ~31) != 0xd5181000 or barrier != 0xd5033fdf:
+            raise ValueError("MMU checkpoint must immediately follow MSR SCTLR_EL1 and ISB")
+    handoff = 0
+    if handoff_offset is not None:
+        handoff = loader + handoff_offset
+        offset = handoff - base
+        if handoff <= target or offset & 3 or offset > len(image) - 4:
+            raise ValueError("handoff checkpoint is outside the loader")
+        if struct.unpack_from("<I", image, offset)[0] != 0xd61f0060:
+            raise ValueError("handoff checkpoint must point to BR X3")
+    if kernel_offset and (kernel_offset < 0 or kernel_offset & 3 or kernel_offset > ini - base - 4):
+        raise ValueError("checkpoint is outside the kernel")
     print(f"Image SHA-256: {hashlib.sha256(image).hexdigest()}", flush=True)
     if native is not None:
         command = [str(native.resolve()), "--trace-loader",
-                   *(hex(value) for value in (len(image), layout, ini, loader, target))]
+                   *(hex(value) for value in (len(image), layout, ini, loader, target, mmu_stop, handoff, kernel_offset))]
         subprocess.run(command, input=image, timeout=timeout, check=True)
         return
 
@@ -152,11 +173,23 @@ def main():
     parser.add_argument("--timeout", type=float, default=10.0)
     parser.add_argument("--native", type=Path, metavar="HORIZONVM",
                         help="use the signed HorizonVM executable instead of QEMU")
+    parser.add_argument("--through-mmu", type=lambda value: int(value, 0), metavar="LOADER_OFFSET",
+                        help="trace to the instruction after the loader's SCTLR write and ISB")
+    parser.add_argument("--handoff", type=lambda value: int(value, 0), metavar="LOADER_OFFSET",
+                        help="follow the loader's final BR X3 back to the kernel")
+    parser.add_argument("--kernel-checkpoint", type=lambda value: int(value, 0), default=0,
+                        metavar="KERNEL_OFFSET", help="follow execution to an offset in the relocated kernel")
     args = parser.parse_args()
+    if args.kernel_checkpoint and args.handoff is None:
+        parser.error("--kernel-checkpoint requires --handoff")
+    if args.handoff is not None and args.through_mmu is None:
+        parser.error("--handoff requires --through-mmu")
+    if args.through_mmu is not None and args.native is None:
+        parser.error("--through-mmu requires --native")
     if not 0 < args.timeout < float("inf"):
         parser.error("--timeout must be positive and finite")
     try:
-        trace(args.image, args.timeout, args.native)
+        trace(args.image, args.timeout, args.native, args.through_mmu, args.handoff, args.kernel_checkpoint)
     except (OSError, ValueError, RuntimeError, struct.error, subprocess.SubprocessError) as error:
         sys.exit(f"Trace failed: {error}")
 
