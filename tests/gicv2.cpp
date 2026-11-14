@@ -49,6 +49,25 @@ int main() {
     write(1, cpu + 4, 0x48);
     assert(hvm_gicv2_irq_pending(&gic, 1));
 
+    // A level PPI is banked, masked by ISENABLER, and reasserts after EOI
+    // until the peripheral drops the line.
+    write(2, cpu, 1);
+    write(2, cpu + 4, 0x80);
+    write(2, dist + 0x41e, 0x40, 1);
+    hvm_gicv2_set_ppi(&gic, 2, 30, true);
+    assert(!hvm_gicv2_irq_pending(&gic, 2));
+    write(2, dist + 0x100, 1u << 30);
+    assert(hvm_gicv2_irq_pending(&gic, 2));
+    assert(read(2, cpu + 0xc) == 30);
+    assert((read(2, dist + 0x300) & (1u << 30)) != 0);
+    assert(!hvm_gicv2_irq_pending(&gic, 2));
+    write(2, cpu + 0x10, 30);
+    assert(hvm_gicv2_irq_pending(&gic, 2));
+    assert(read(2, cpu + 0xc) == 30);
+    hvm_gicv2_set_ppi(&gic, 2, 30, false);
+    write(2, cpu + 0x10, 30);
+    assert(!hvm_gicv2_irq_pending(&gic, 2));
+
     uint32_t ignored = 0;
     assert(!hvm_gicv2_access(&gic, 0, dist + 0x401, 4, true, &ignored));
     assert(!hvm_gicv2_access(&gic, 0, dist + 0xff0, 4, false, &ignored));

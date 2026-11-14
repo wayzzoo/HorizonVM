@@ -93,7 +93,7 @@ class GdbRemote:
             raise RuntimeError(f"unexpected QEMU stop: {response}")
 
 
-def trace(image_path, timeout, native, mmu_offset, handoff_offset, kernel_offset, secondary_offset, main_offset, smp_offset, verify_barrier, write0_offset):
+def trace(image_path, timeout, native, mmu_offset, handoff_offset, kernel_offset, secondary_offset, main_offset, smp_offset, verify_barrier, write0_offset, timer_smoke):
     with image_path.open("rb") as file:
         image = file.read(MAX_IMAGE_SIZE + 1)
     if len(image) > MAX_IMAGE_SIZE:
@@ -138,7 +138,7 @@ def trace(image_path, timeout, native, mmu_offset, handoff_offset, kernel_offset
     print(f"Image SHA-256: {hashlib.sha256(image).hexdigest()}", flush=True)
     if native is not None:
         command = [str(native.resolve()), "--trace-loader",
-                   *(hex(value) for value in (len(image), layout, ini, loader, target, mmu_stop, handoff, kernel_offset, secondary_offset, main_offset, smp_offset, write0_offset))]
+                   *(hex(value) for value in (len(image), layout, ini, loader, target, mmu_stop, handoff, kernel_offset, secondary_offset, main_offset, smp_offset, write0_offset, timer_smoke))]
         subprocess.run(command, input=image, timeout=timeout, check=True)
         return
 
@@ -206,11 +206,13 @@ def main():
                                 metavar="KERNEL_OFFSET", help="run all cores to a shared kernel checkpoint")
     parser.add_argument("--semihost-write0", type=lambda value: int(value, 0), default=0,
                         metavar="KERNEL_OFFSET", help="forward SYS_WRITE0 debug strings to stdout")
+    smp_checkpoint.add_argument("--timer-smoke", action="store_true",
+                                help="run all cores until the first physical timer EOI")
     args = parser.parse_args()
     smp_offset = args.through_barrier or args.smp_checkpoint
-    if args.semihost_write0 and not smp_offset:
-        parser.error("--semihost-write0 requires an SMP checkpoint")
-    if smp_offset and not args.all_cores_entry:
+    if args.semihost_write0 and not (smp_offset or args.timer_smoke):
+        parser.error("--semihost-write0 requires an SMP run")
+    if (smp_offset or args.timer_smoke) and not args.all_cores_entry:
         parser.error("an SMP checkpoint requires --all-cores-entry")
     if args.all_cores_entry and (
         not args.secondary_checkpoint or args.secondary_checkpoint != args.kernel_checkpoint
@@ -229,7 +231,7 @@ def main():
     try:
         trace(args.image, args.timeout, args.native, args.through_mmu, args.handoff,
               args.kernel_checkpoint, args.secondary_checkpoint, args.all_cores_entry, smp_offset, bool(args.through_barrier),
-              args.semihost_write0)
+              args.semihost_write0, args.timer_smoke)
     except (OSError, ValueError, RuntimeError, struct.error, subprocess.SubprocessError) as error:
         sys.exit(f"Trace failed: {error}")
 

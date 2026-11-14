@@ -37,19 +37,22 @@ bool bytes(uint8_t *regs, unsigned index, unsigned width, uint8_t mask,
     return true;
 }
 
-// This boot profile delivers group 0 SGIs at one active priority level.
-unsigned next_sgi(const hvm_gicv2_t &gic, unsigned core) {
+// This boot profile delivers group 0 local interrupts at one active priority level.
+unsigned next_local_irq(const hvm_gicv2_t &gic, unsigned core) {
     const auto &cpu = gic.cpu[core];
-    if (!gic.control || !cpu.control || cpu.active_sgi) {
+    if (!gic.control || !cpu.control || cpu.active_irq) {
         return 1023;
     }
     unsigned best = 1023;
     unsigned priority = cpu.priority_mask;
-    for (unsigned id = 0; id < 16; ++id) {
-        if (cpu.sgi_sources[id] && !(gic.local[core].group & (1u << id)) &&
-            gic.local[core].priority[id] < priority) {
+    const auto &local = gic.local[core];
+    const uint32_t pending_ppis = (cpu.ppi_level | local.pending) & local.enabled;
+    for (unsigned id = 0; id < 32; ++id) {
+        const auto mask = 1u << id;
+        const bool pending = id < 16 ? cpu.sgi_sources[id] != 0 : (pending_ppis & mask) != 0;
+        if (pending && !((local.group | local.active) & mask) && local.priority[id] < priority) {
             best = id;
-            priority = gic.local[core].priority[id];
+            priority = local.priority[id];
         }
     }
     return best;
@@ -137,7 +140,8 @@ bool distributor(hvm_gicv2_t &gic, unsigned core, unsigned offset,
         if (bank_index == 0 && write) {
             value &= 0xffff0000u;
         }
-        return bitmap(bank.pending, offset < 0x280, write, value);
+        return bitmap(bank.pending, offset < 0x280, write, value,
+                      bank_index == 0 ? gic.cpu[core].ppi_level : 0);
     case 0x300:
     case 0x380:
         return bitmap(bank.active, offset < 0x380, write, value);
@@ -172,22 +176,29 @@ extern "C" bool hvm_gicv2_access(hvm_gicv2_t *gic, unsigned core, uint64_t ipa,
         if (write) {
             return false;
         }
-        const unsigned id = next_sgi(*gic, core);
+        const unsigned id = next_local_irq(*gic, core);
         if (id == 1023) {
             *value = id;
             return true;
         }
-        const unsigned sender = std::countr_zero(cpu.sgi_sources[id]);
-        cpu.sgi_sources[id] &= ~(1u << sender);
-        *value = (sender << 10) | id;
-        cpu.active_sgi = *value + 1;
+        *value = id;
+        if (id < 16) {
+            const unsigned sender = std::countr_zero(cpu.sgi_sources[id]);
+            cpu.sgi_sources[id] &= ~(1u << sender);
+            *value |= sender << 10;
+        } else {
+            gic->local[core].pending &= ~(1u << id);
+        }
+        gic->local[core].active |= 1u << id;
+        cpu.active_irq = *value + 1;
         return true;
     }
     case 0x10:
-        if (!write || !cpu.active_sgi || (*value & 0x1fff) + 1 != cpu.active_sgi) {
+        if (!write || !cpu.active_irq || (*value & 0x1fff) + 1 != cpu.active_irq) {
             return false;
         }
-        cpu.active_sgi = 0;
+        gic->local[core].active &= ~(1u << ((*value) & 0x3ff));
+        cpu.active_irq = 0;
         return true;
     default:
         return false;
@@ -195,5 +206,12 @@ extern "C" bool hvm_gicv2_access(hvm_gicv2_t *gic, unsigned core, uint64_t ipa,
 }
 
 extern "C" bool hvm_gicv2_irq_pending(const hvm_gicv2_t *gic, unsigned core) {
-    return gic && core < HVM_GICV2_CPUS && next_sgi(*gic, core) != 1023;
+    return gic && core < HVM_GICV2_CPUS && next_local_irq(*gic, core) != 1023;
+}
+
+extern "C" void hvm_gicv2_set_ppi(hvm_gicv2_t *gic, unsigned core, unsigned id, bool asserted) {
+    if (gic && core < HVM_GICV2_CPUS && id >= 16 && id < 32) {
+        auto &levels = gic->cpu[core].ppi_level;
+        levels = asserted ? levels | (1u << id) : levels & ~(1u << id);
+    }
 }

@@ -1,5 +1,7 @@
 # Mesosphère scheduler startup on M1
 
+The follow-up [physical timer trace](mesosphere-physical-timer.md) verifies PPI 30 delivery.
+
 Four Hypervisor.framework vCPUs reached the final common
 `HorizonKernelMain` checkpoint at image offset `0x25ccc`.
 This follows main and idle thread initialization, memory-manager setup,

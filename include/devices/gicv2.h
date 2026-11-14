@@ -25,7 +25,8 @@ typedef struct {
     uint32_t control;
     uint32_t priority_mask;
     uint32_t binary_point;
-    uint32_t active_sgi;
+    uint32_t active_irq;
+    uint32_t ppi_level;
     uint8_t sgi_sources[16];
 } hvm_gicv2_cpu_t;
 
@@ -37,9 +38,10 @@ typedef struct {
     uint8_t shared_targets[32];
 } hvm_gicv2_t;
 
-/* Group 0 boot register and SGI model. Callers serialize concurrent accesses. */
+/* Group 0 boot register, SGI and level-triggered PPI model. Callers serialize concurrent accesses. */
 bool hvm_gicv2_access(hvm_gicv2_t *gic, unsigned core, uint64_t ipa,
                       unsigned width, bool write, uint32_t *value);
+void hvm_gicv2_set_ppi(hvm_gicv2_t *gic, unsigned core, unsigned id, bool asserted);
 bool hvm_gicv2_irq_pending(const hvm_gicv2_t *gic, unsigned core);
 
 #ifdef __cplusplus
